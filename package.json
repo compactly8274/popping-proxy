@@ -1,0 +1,12 @@
+{
+  "name": "popping-proxy",
+  "version": "1.0.0",
+  "description": "Tiny Reddit JSON proxy for the Popping dashboard",
+  "type": "module",
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  },
+  "license": "MIT"
+}

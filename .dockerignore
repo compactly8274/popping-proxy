@@ -1,0 +1,6 @@
+node_modules
+bun.lockb
+.env
+.git
+.gitignore
+*.log

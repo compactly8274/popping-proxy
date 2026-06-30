@@ -1,0 +1,27 @@
+services:
+  popping-proxy:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Override these in a .env file or your compose override.
+      # 3001 — chosen to sit one above the user's real Hydra
+      # service, which already owns 3000. Override with PORT=…
+      # if 3001 is taken on the VPS.
+      PORT: "3001"
+      USER_AGENT: "popping-proxy/1.0 (+https://github.com/compactly8274/popping; contact: you@example.com)"
+      # 2 req/s sustained, 4 burst. Popping's cross-ref sweep fires
+      # ~50 requests in a tight loop; the limiter spreads them out
+      # so Reddit sees a polite cadence.
+      RATE_SUSTAINED: "2"
+      RATE_BURST: "4"
+      UPSTREAM_TIMEOUT_S: "10"
+    # Bind to localhost only — terminate TLS at your existing
+    # reverse proxy (Caddy / Traefik / nginx) and forward
+    # hydra.pancakefarts.site -> 127.0.0.1:3001.
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
