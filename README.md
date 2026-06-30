@@ -4,6 +4,8 @@ Tiny Reddit JSON proxy for the [Popping](https://github.com/compactly8274/poppin
 
 Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll on a schedule. This proxy sits in front of Reddit on your VPS so all the dashboard's per-subreddit fetches and cross-reference searches leave one IP, with one rate limiter, instead of being scattered across wherever Popping happens to be running.
 
+**Optional with newer Popping.** As of `popping@6869d74` the backend can scrape Reddit's `.json` endpoints directly with a polite per-process token bucket. The proxy is still the recommended path for any deployment on a residential / datacenter IP that Reddit's anti-abuse flags, but a small personal instance on a home IP that hasn't been throttled yet will work fine without it. Run `python /app/scripts/reddit_reachability.py` inside `popping-backend-1` to probe whether direct mode will work from your IP.
+
 ## Endpoints
 
 | Method | Path | Upstream |
@@ -24,10 +26,10 @@ Reddit throttles unauthenticated requests to `www.reddit.com` aggressively when 
 docker compose up -d
 ```
 
-The container listens on `127.0.0.1:3001` (chosen to sit one above your existing Hydra service, which owns 3000). Put a Caddy vhost in front:
+The container listens on `127.0.0.1:3001` (chosen to sit one above your existing Hydra service, which owns 3000). Put a Caddy vhost in front. **Use a separate subdomain from your existing Hydra** — the iPhone-app Hydra keeps owning `hydra.pancakefarts.site`, and the proxy takes something else like `reddit.pancakefarts.site`:
 
 ```caddyfile
-hydra.pancakefarts.site {
+reddit.pancakefarts.site {
     encode zstd gzip
     reverse_proxy 127.0.0.1:3001
 }
@@ -36,18 +38,20 @@ hydra.pancakefarts.site {
 Then point Popping at it:
 
 ```env
-REDDIT_HYDRA_URL=https://hydra.pancakefarts.site
+REDDIT_HYDRA_URL=https://reddit.pancakefarts.site
 ```
 
-The startup line in `popping-backend-1` should change from `reddit_client: disabled` to `reddit_client: configured (url=https://hydra.pancakefarts.site, auth=no)`.
+The startup line in `popping-backend-1` should change from `reddit_client: direct mode (no proxy; throttled to 2.0 req/s, burst 4)` to `reddit_client: proxy mode (url=https://reddit.pancakefarts.site, auth=no)`.
+
+To go back to direct mode later, clear the env var (set it to empty / unset it) and restart.
 
 ## Sanity check
 
 ```sh
-curl -s https://hydra.pancakefarts.site/healthz
+curl -s https://reddit.pancakefarts.site/healthz
 # {"ok":true,"version":"1.0.0"}
 
-curl -s "https://hydra.pancakefarts.site/r/python/hot?limit=1" | head -c 500
+curl -s "https://reddit.pancakefarts.site/r/python/hot?limit=1" | head -c 500
 # [{"id":"t3_...","title":"...","score":...,"num_comments":...,"permalink":"/r/python/comments/...","url":"...","subreddit":"python",...}]
 ```
 
