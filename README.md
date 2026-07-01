@@ -31,13 +31,16 @@ Even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours —
 ```sh
 docker run -d --name popping-proxy \
   --restart unless-stopped \
-  --cap-add=NET_ADMIN \
+  --cap-add=NET_ADMIN --cap-add=MKNOD \
+  --device-cgroup-rule='c 10:200 rwm' \
+  --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   -p 127.0.0.1:3001:3001 \
   -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
   ghcr.io/<owner>/popping-proxy:latest
 ```
 
-Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence. The `--cap-add=NET_ADMIN` is required for WARP to bring up its tun device inside the container; the entrypoint will fail loudly without it.
+Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence. The `--cap-add`, `--device-cgroup-rule`, and `--sysctl` flags are required for WARP to bring up its tun device and route packets correctly; the entrypoint will fail loudly without them.
 
 The image is rebuilt automatically on every push to `main` and on every `v*` tag. Pin to a specific version with `:0.1.0` or `:sha-<short>` for reproducible deploys.
 
@@ -121,29 +124,46 @@ your traffic through Cloudflare's network. The proxy image ships
 with `warp-svc` and `warp-cli` installed; on first boot the
 `entrypoint.sh` script:
 
-1. Starts `warp-svc` in the background (needs `CAP_NET_ADMIN` to
-   create the WireGuard tun device).
-2. Registers the client anonymously (one-time, writes
+1. Creates `/dev/net/tun` if the host hasn't injected it
+   (character device, major 10 minor 200).
+2. Starts an in-container dbus system bus (warp-svc's
+   `power_notifier` subsystem retries dbus every 3s without one,
+   filling the log).
+3. Starts `warp-svc` in the background (needs `CAP_NET_ADMIN` to
+   create the WireGuard tun device; `--accept-tos` to skip the
+   TOS prompt on first run).
+4. Waits for the daemon to respond to `warp-cli status` queries.
+5. Registers the client anonymously (one-time, writes
    `/var/lib/cloudflare-warp/reg.json`).
-3. Puts WARP into **proxy mode** — this opens `127.0.0.1:40000` as
+6. Puts WARP into **proxy mode** — this opens `127.0.0.1:40000` as
    a SOCKS5 endpoint that Bun's `fetch` uses directly, without
    taking over the container's network namespace.
-4. Connects and waits for the SOCKS5 socket to be listening.
-5. Drops privileges to the unprivileged `bun` user and execs the
+7. Connects and waits for the SOCKS5 socket to be listening.
+8. Drops privileges to the unprivileged `bun` user and execs the
    server.
 
 If the SOCKS5 socket never comes up, the entrypoint fails fast with
 a clear log line and the container restarts. Most common causes:
 
-- **`--cap-add=NET_ADMIN` missing.** Check `docker inspect
-  <container> | grep CapAdd` — the `NET_ADMIN` line should be
-  present. Add it to the compose file's `cap_add:` list and restart.
+- **`--cap-add=NET_ADMIN` or `--cap-add=MKNOD` missing.** Check
+  `docker inspect <container> | grep CapAdd` — both `NET_ADMIN` and
+  `MKNOD` should be present. Add to the compose file's `cap_add:`
+  list and restart.
+- **`device_cgroup_rules: ['c 10:200 rwm']` missing.** Even with
+  `CAP_NET_ADMIN` and `/dev/net/tun` present, the kernel blocks
+  opens on the device unless the cgroup is granted r/w/m. The
+  compose file already has this; check it didn't get dropped in
+  a custom override.
+- **`sysctls` not set on the container.** `net.ipv4.conf.all.src_valid_mark=1`
+  and `net.ipv6.conf.all.disable_ipv6=0` are required for WireGuard's
+  packet routing. The compose file has them; check `docker inspect
+  <container> | grep -i sysctl` to confirm they made it through.
 - **TUN device not available on the host.** Some kernel configs
-  and OpenVZ/LXC virtualization backends don't expose `/dev/net/tun`.
-  Check `ls -la /dev/net/tun` on the host; the device file should
-  exist. A VPS provider that virtualizes on OpenVZ typically can't
-  run WARP — switch to a KVM-backed VPS (Hetzner, Racknerd KVM,
-  Vultr, DigitalOcean, etc.).
+  and OpenVZ/LXC virtualization backends don't expose `/dev/net/tun`
+  at all. Check `ls -la /dev/net/tun` on the host; the device file
+  should exist. A VPS provider that virtualizes on OpenVZ typically
+  can't run WARP — switch to a KVM-backed VPS (Hetzner, Racknerd
+  KVM, Vultr, DigitalOcean, etc.).
 - **WARP registration endpoint blocked by the host's egress
   firewall.** Rare; WARP needs to talk to `https://api.cloudflareclient.com`
   on first boot to register. If your VPS blocks outbound HTTPS to
@@ -164,7 +184,12 @@ popping-proxy 1.0.0 listening on :3001 (routing: WARP socks5 -> 127.0.0.1:40000)
 
 ```sh
 docker build -t popping-proxy:dev .
-docker run --rm --cap-add=NET_ADMIN -p 127.0.0.1:3001:3001 popping-proxy:dev
+docker run --rm \
+  --cap-add=NET_ADMIN --cap-add=MKNOD \
+  --device-cgroup-rule='c 10:200 rwm' \
+  --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+  -p 127.0.0.1:3001:3001 popping-proxy:dev
 ```
 
 The Dockerfile is a small `oven/bun:1.1-debian` base that installs
@@ -172,10 +197,13 @@ The Dockerfile is a small `oven/bun:1.1-debian` base that installs
 server file and the entrypoint script in, and runs the entrypoint
 as root (warp-svc needs `CAP_NET_ADMIN`). The entrypoint brings
 up WARP, then drops privileges to the unprivileged `bun` user
-before exec'ing the server. `--cap-add=NET_ADMIN` is required
-when running locally too. We use the debian base, not alpine,
-because WARP's `warp-svc` is a closed-source glibc-linked
-binary and does not run on musl.
+before exec'ing the server. The `cap_add`, `device_cgroup_rules`,
+and `sysctls` lines in docker-compose (and the equivalent
+`--cap-add` / `--device-cgroup-rule` / `--sysctl` flags above)
+are required — without them, WARP's tun device can't be created
+or the WireGuard handshake silently fails. We use the debian
+base, not alpine, because WARP's `warp-svc` is a closed-source
+glibc-linked binary and does not run on musl.
 
 ## License
 

@@ -27,14 +27,30 @@ services:
     # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
     pull_policy: always
-    # Cloudflare WARP runs in the container as warp-svc. It needs
-    # CAP_NET_ADMIN to create the WireGuard tun device, even in
-    # proxy mode (the daemon still creates the tun; it just doesn't
-    # route the host's traffic through it). Without this cap the
-    # entrypoint fails fast on the SOCKS5 wait and the container
-    # restarts — visible in `docker logs`.
+    # Cloudflare WARP runs in the container as warp-svc. Capabilities
+    # needed:
+    #   - NET_ADMIN: manage the WireGuard tun device and routes.
+    #   - MKNOD:    create /dev/net/tun if it's not pre-injected
+    #               (the entrypoint mknods it as a fallback).
+    # device_cgroup_rules grants r/w/m access to the TUN char device
+    # (major 10, minor 200); without this the kernel blocks opens
+    # on the device even when CAP_NET_ADMIN is held.
+    # sysctls:
+    #   - net.ipv4.conf.all.src_valid_mark=1: required for
+    #     WireGuard's fwmark-based source-routing trick. Without
+    #     this, the WireGuard handshake succeeds but the response
+    #     packets get dropped because the kernel can't route them
+    #     back through the tun interface.
+    #   - net.ipv6.conf.all.disable_ipv6=0: warp-svc expects IPv6
+    #     to be available on the tun interface.
     cap_add:
       - NET_ADMIN
+      - MKNOD
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv6.conf.all.disable_ipv6=0
     environment:
       PORT: "3001"
       # Reddit wants a real contact in the UA. The default below is

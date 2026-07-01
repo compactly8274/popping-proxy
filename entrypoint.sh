@@ -2,20 +2,29 @@
 # entrypoint.sh — bring up Cloudflare WARP in proxy mode, then exec bun.
 #
 # Sequence:
-#   1. Start warp-svc (needs root for the WireGuard tun device)
-#   2. Wait for the daemon's control socket
-#   3. Register the client if not already registered
-#   4. Set proxy mode (opens 127.0.0.1:40000 as a SOCKS5 endpoint —
+#   0. Create /dev/net/tun (WireGuard interface needs it)
+#   1. Start dbus system bus (warp-svc's power_notifier talks to it;
+#      not strictly required for proxy mode but suppresses a flood
+#      of retry log lines that would otherwise mask real errors)
+#   2. Start warp-svc (needs root for the WireGuard tun device)
+#   3. Wait for the daemon's IPC to be reachable
+#   4. Register the client if not already registered (anonymous)
+#   5. Set proxy mode (opens 127.0.0.1:40000 as a SOCKS5 endpoint —
 #      this is what Bun's `fetch` will use via its `proxy:` option)
-#   5. Connect
-#   6. Wait for the SOCKS5 socket to be listening
-#   7. Drop privs to the `bun` user, exec the bun server
+#   6. Connect
+#   7. Wait for the SOCKS5 socket to be listening
+#   8. Drop privs to the `bun` user, exec the bun server
 #
 # Why this is its own script: warp-svc needs CAP_NET_ADMIN to create
 # the tun device, but the proxy itself runs as the unprivileged `bun`
 # user. Doing the priv-drop in the entrypoint keeps the proxy process
 # running as a non-root user, so a request-handler bug can't escape
 # the container.
+#
+# Reference: cmj2002/warp-docker's entrypoint pattern (the canonical
+# "WARP in Docker" project). Their daemon doesn't strictly need
+# dbus to function, but it spams the log without it; the mknod and
+# dbus-daemon calls below are from their setup.
 
 set -eu
 
@@ -29,50 +38,77 @@ fail() {
     exit 1
 }
 
-# --- 1. Start warp-svc -------------------------------------------------------
+# --- 0. Create the TUN device if missing -----------------------------------
+# The WireGuard interface warp-svc creates needs /dev/net/tun with
+# major 10, minor 200. The Docker container may not have this node
+# pre-created (the `device_cgroup_rules` line in docker-compose
+# only controls access, not creation). mknod needs CAP_MKNOD; the
+# `mknod` package in the Dockerfile pulls in the binary, and the
+# `cap_add: [MKNOD]` in compose grants the cap.
+if [ ! -e /dev/net/tun ]; then
+    log "tun: /dev/net/tun missing, creating"
+    mkdir -p /dev/net
+    # Major 10, minor 200, character device. mknod is in /bin on
+    # debian-slim (from the `mknod` apt package, an alternative
+    # implementation of mknod that works in containers where the
+    # busybox version is missing).
+    mknod /dev/net/tun c 10 200
+    chmod 600 /dev/net/tun
+    log "tun: created /dev/net/tun (c 10 200)"
+else
+    log "tun: /dev/net/tun already present"
+fi
+
+# --- 1. Start dbus system bus ------------------------------------------------
+# warp-svc's power_notifier subsystem connects to dbus on every
+# 3s interval; without dbus, the log fills with retry warnings
+# that mask the real error. We don't strictly need dbus for the
+# proxy to work, but starting it makes the log readable when
+# something else goes wrong. A system bus is overkill (we have
+# one process in one container) but it's what the reference
+# projects use and it works.
+mkdir -p /run/dbus
+rm -f /run/dbus/pid
+log "dbus: starting system bus"
+dbus-daemon --system --fork
+log "dbus: system bus up"
+
+# --- 2. Start warp-svc -------------------------------------------------------
 # The daemon writes its log to /var/log/cloudflare-warp/ in some
-# Alpine builds and to stderr in others. Redirect both to our stdout
-# so docker logs captures it. The `&` puts it in the background; we
-# track the PID for the wait below.
+# builds and to stderr in others. Redirect both to our stdout so
+# docker logs captures it. The `&` puts it in the background.
+# --accept-tos: TOS acceptance is required since 2024; without
+# this, the daemon refuses to start cleanly.
 log "warp-svc: starting"
 mkdir -p /var/run/cloudflare-warp /var/lib/cloudflare-warp
-warp-svc >/tmp/warp-svc.log 2>&1 &
+warp-svc --accept-tos >/tmp/warp-svc.log 2>&1 &
 WARP_PID=$!
 log "warp-svc: pid=$WARP_PID"
 
-# --- 2. Wait for the daemon's control socket --------------------------------
-# warp-cli talks to warp-svc over a Unix socket under /var/run/.
-# Poll for the socket file (with a timeout) so we don't race the
-# daemon's startup.
-#
-# `SECONDS` is a bash-ism; on debian /bin/sh is dash and doesn't
-# define it. Use date +%s arithmetic instead — POSIX-portable.
+# --- 3. Wait for the daemon to be reachable via warp-cli --------------------
+# Instead of polling for a specific socket file (whose name we
+# don't know for certain across versions), poll the daemon with
+# `warp-cli status` — that command blocks on the IPC and gives
+# us an authoritative "ready" signal. POSIX-portable deadline
+# arithmetic.
 deadline=$(( $(date +%s) + 30 ))
-while [ ! -S /var/run/cloudflare-warp/warp-svc.sock ] \
-    && [ $(date +%s) -lt $deadline ]; do
-    sleep 0.2
+while ! warp-cli status >/dev/null 2>&1; do
+    if [ $(date +%s) -ge $deadline ]; then
+        log "warp-cli: daemon not responding to status queries after 30s"
+        log "warp-cli: --- last 20 log lines ---"
+        tail -20 /tmp/warp-svc.log 2>/dev/null || true
+        fail "warp-svc did not become ready"
+    fi
+    sleep 0.5
 done
-if [ ! -S /var/run/cloudflare-warp/warp-svc.sock ]; then
-    log "warp-svc: control socket not up after 30s"
-    log "warp-svc: --- last 20 log lines ---"
-    tail -20 /tmp/warp-svc.log 2>/dev/null || true
-    fail "warp-svc did not become ready"
-fi
-log "warp-svc: control socket ready"
+log "warp-svc: responding to status queries"
 
-# --- 3. Register the client (anonymous, one-time) ---------------------------
+# --- 4. Register the client (anonymous, one-time) ---------------------------
 # /var/lib/cloudflare-warp/reg.json is written on a successful
 # registration. Skip the call if the file already exists so
 # container restarts don't churn the client identity.
-# --accept-tos: the WARP client requires explicit TOS acceptance
-# since 2024. Without it `registration new` exits non-zero with a
-# "TOS not accepted" error.
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
     log "warp-cli: registering (anonymous)"
-    # --accept-tos: the WARP client requires explicit TOS acceptance
-    # since 2024. Without it `registration new` exits non-zero with a
-    # "TOS not accepted" error. Subcommand form (rather than the
-    # global --accept-tos) is what the official docs use.
     if ! warp-cli registration new --accept-tos; then
         log "warp-cli: registration failed"
         log "warp-cli: --- last 20 log lines ---"
@@ -84,7 +120,7 @@ else
     log "warp-cli: already registered (skipping)"
 fi
 
-# --- 4. Set proxy mode ------------------------------------------------------
+# --- 5. Set proxy mode ------------------------------------------------------
 # Proxy mode is the critical bit: it opens 127.0.0.1:40000 as a
 # SOCKS5 endpoint that Bun's fetch can use directly, without
 # taking over the container's network namespace. TUN mode would
@@ -102,7 +138,7 @@ warp-cli mode proxy >/dev/null
 log "warp-cli: setting proxy port to 40000"
 warp-cli proxy port 40000 >/dev/null
 
-# --- 5. Connect -------------------------------------------------------------
+# --- 6. Connect -------------------------------------------------------------
 log "warp-cli: connecting"
 if ! warp-cli connect; then
     log "warp-cli: connect failed"
@@ -112,7 +148,7 @@ if ! warp-cli connect; then
 fi
 log "warp-cli: connected"
 
-# --- 6. Wait for the SOCKS5 socket ------------------------------------------
+# --- 7. Wait for the SOCKS5 socket ------------------------------------------
 # The SOCKS5 listener is on 127.0.0.1:40000 once the tunnel is up.
 # `nc -z` (from netcat-openbsd, the default on debian-slim) does a
 # zero-I/O connect probe and exits 0 on success. Poll until it
@@ -129,7 +165,7 @@ while ! nc -z 127.0.0.1 40000 2>/dev/null; do
 done
 log "warp-cli: socks5 ready on 127.0.0.1:40000"
 
-# --- 7. Drop privs, exec bun -----------------------------------------------
+# --- 8. Drop privs, exec bun -----------------------------------------------
 # `su` from util-linux (installed by the `passwd` package, which
 # the cloudflare-warp deb pulls in transitively) handles the
 # user switch fine. The `exec` replaces the shell so the bun

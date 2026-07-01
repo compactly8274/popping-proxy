@@ -11,7 +11,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg iptables lsb-release; \
+        ca-certificates curl dbus gnupg iptables lsb-release mknod; \
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
         | gpg --dearmor \
         -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; \
