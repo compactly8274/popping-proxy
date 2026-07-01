@@ -41,6 +41,13 @@ services:
       RATE_SUSTAINED: "2"
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
+      # Webshare residential proxy pool. Set this to your Webshare
+      # token (`USERNAME-PASSWORD` form, a dash not a colon) to
+      # route all Reddit requests through a rotating residential IP
+      # pool. Without it, requests go direct from the proxy VPS and
+      # Reddit CDN-blocks most datacenter IPs within hours of polling
+      # cadence. Sign up at https://webshare.io (~$3.50/month for 1GB).
+      # WEBSHARE_TOKEN: "username-password"
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:

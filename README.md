@@ -20,6 +20,8 @@ The `/r/...` endpoint returns a flat JSON list of post objects (Reddit's `data.c
 
 Reddit throttles unauthenticated requests to `www.reddit.com` aggressively when they come from datacenter / VPS IPs and arrive on a polling cadence. The original Popping Reddit integration assumed a third-party "Hydra" gateway would handle that, but the only popular Hydra server ([dmilin1/hydra-server](https://github.com/dmilin1/hydra-server)) is a mobile-app backend, not a Reddit scraper. This proxy is the missing piece: ~150 lines of Bun that does the one job Popping needs.
 
+The proxy is still necessary for any production deploy — even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours. Pair it with a [Webshare](https://webshare.io) residential token (set `WEBSHARE_TOKEN` in the container env) and Reddit sees a rotating residential IP per request. See the **Webshare setup** section below.
+
 ## Run it
 
 ### Pre-built image (recommended)
@@ -88,6 +90,7 @@ curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
 | `RATE_SUSTAINED` | `2` | Tokens added per second to the bucket. |
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
+| `WEBSHARE_TOKEN` | _(unset)_ | Webshare residential proxy token, format `USERNAME-PASSWORD` (a dash, not a colon). When set, every Reddit request is routed through Webshare's rotating residential IP pool. **Required for any production deploy on a datacenter / VPS IP** — Reddit CDN-level blocks most datacenter ranges within hours of polling cadence, regardless of UA or cadence. Sign up at [webshare.io](https://webshare.io) (~$3.50/month for 1GB, plenty for Popping's polling cadence). |
 
 ### User-Agent recommendations
 
@@ -102,6 +105,39 @@ popping-proxy/1.0 (+https://reddit.yourdomain.com; contact: you@yourdomain.com)
 ```
 
 Don't use: `python-requests`, `curl/7.x`, `httpx/0.x`, generic `<app>/<version>` with no URL, or a UA with a `noreply@` email — all of these either get 429'd fast or flagged for stricter review.
+
+### Webshare setup (recommended for production)
+
+Reddit CDN-level blocks most datacenter / VPS IP ranges. The 403s come
+back as a ~190KB `text/html` block page in ~100ms — that's the CDN
+edge refusing the connection, not Reddit's anti-abuse pattern matching.
+No amount of User-Agent tuning or rate limiting will fix it: the IP is
+rejected before the request reaches Reddit's actual stack. A fresh
+VPS IP works for a few requests, then gets added to the blocklist.
+
+The fix is to route requests through a residential IP pool. The
+cheapest option that just works is [Webshare](https://webshare.io)
+(~$3.50/month for 1GB bandwidth, more than enough for Popping's
+polling cadence — Popping's cross-ref sweep uses ~50 requests/hour,
+each returning 1–2 KB).
+
+1. Sign up at <https://webshare.io> (rotating residential proxy,
+   any plan).
+2. From the dashboard, grab a **static proxy** token. It looks like
+   `abc123xyz-mysecretpassword` — note the dash, not a colon.
+3. Set it in the proxy container's environment:
+   ```env
+   WEBSHARE_TOKEN: "abc123xyz-mysecretpassword"
+   ```
+4. Restart the container. The startup log should now read
+   `popping-proxy 1.0.0 listening on :3001 (routing: Webshare
+   residential pool (token set))`. If it still says `direct`, the
+   env var didn't reach the container — check `docker inspect`.
+
+The token is sensitive (it grants proxy access to your account) but
+the cost of a leaked one is bounded by Webshare's bandwidth cap, not
+your credit card — set a hard usage alert in the Webshare dashboard
+if you want belt-and-braces.
 
 ## Building the image locally
 

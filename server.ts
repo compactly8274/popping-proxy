@@ -96,6 +96,32 @@ const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
 
+// Webshare residential proxy pool. When WEBSHARE_TOKEN is set, every
+// Reddit request is routed through Webshare's rotating residential
+// IP pool. The token format is `USERNAME-PASSWORD` (a dash, not a
+// colon — Webshare's static proxy endpoint takes basic auth, not a
+// bearer token). The proxy URL is built from that pair against
+// p.webshare.io:80. Cost: ~$3.50/month for 1GB bandwidth, which
+// covers Popping's polling cadence for years.
+//
+// When unset, requests go direct from the proxy VPS to Reddit. That
+// works for a while on a fresh VPS IP, but Reddit CDN-level blocks
+// most datacenter ranges within hours of polling cadence, so a
+// production deploy should always set this.
+const WEBSHARE_TOKEN = (process.env.WEBSHARE_TOKEN ?? "").trim();
+const WEBSHARE_PROXY_URL = WEBSHARE_TOKEN
+  ? (() => {
+      // Webshare's static proxy format: http://USERNAME:PASSWORD@p.webshare.io:80
+      // The token they issue is `USERNAME-PASSWORD`; we split on the
+      // first dash and rejoin with `:` for the URL.
+      const dash = WEBSHARE_TOKEN.indexOf("-");
+      if (dash < 1 || dash === WEBSHARE_TOKEN.length - 1) return null;
+      const user = WEBSHARE_TOKEN.slice(0, dash);
+      const pass = WEBSHARE_TOKEN.slice(dash + 1);
+      return `http://${user}:${pass}@p.webshare.io:80`;
+    })()
+  : null;
+
 const VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
@@ -151,15 +177,24 @@ async function fetchReddit(path: string): Promise<Response> {
   const url = `https://www.reddit.com${path}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
+  // Bun's fetch accepts a `proxy` option (string URL) for HTTP
+  // CONNECT-style proxying. When WEBSHARE_PROXY_URL is set we route
+  // through Webshare's residential pool; when null, we go direct.
+  // Bun's option type is `proxy?: string`, so we pass it only when
+  // defined to avoid sending `proxy: undefined`.
+  const init: RequestInit & { proxy?: string } = {
+    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    signal: ctrl.signal,
+    // No follow-redirects option needed; Reddit's `.json` endpoints
+    // don't redirect, and the few 30x they emit (rare) point at the
+    // same host. Bun's fetch follows redirects by default which is
+    // what we want here.
+  };
+  if (WEBSHARE_PROXY_URL) {
+    init.proxy = WEBSHARE_PROXY_URL;
+  }
   try {
-    return await fetch(url, {
-      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-      signal: ctrl.signal,
-      // No follow-redirects option needed; Reddit's `.json` endpoints
-      // don't redirect, and the few 30x they emit (rare) point at the
-      // same host. Bun's fetch follows redirects by default which is
-      // what we want here.
-    });
+    return await fetch(url, init);
   } finally {
     clearTimeout(timer);
   }
@@ -346,4 +381,7 @@ const server = Bun.serve({
   },
 });
 
-console.log(`popping-proxy ${VERSION} listening on :${server.port}`);
+const route = WEBSHARE_PROXY_URL
+  ? `Webshare residential pool (token set)`
+  : `direct (no WEBSHARE_TOKEN; expect 403s on datacenter IPs)`;
+console.log(`popping-proxy ${VERSION} listening on :${server.port} (routing: ${route})`);
