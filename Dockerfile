@@ -11,7 +11,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl dbus gnupg iptables lsb-release mknod; \
+        ca-certificates curl dbus gnupg iptables lsb-release; \
+    # mknod is provided by coreutils, which is already in
+    # debian-slim. The entrypoint uses it to create /dev/net/tun
+    # if the host hasn't injected one.
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
         | gpg --dearmor \
         -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; \
