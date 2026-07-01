@@ -17,15 +17,14 @@
 #    anti-abuse will 403 you within hours of polling cadence if
 #    the UA is generic. The pattern Reddit's docs recommend is
 #    `<app>/<version> (+<project-url>; contact: <real-email>)`.
-# 3. Bind to localhost only — terminate TLS at your existing
-#    reverse proxy (Caddy / Traefik / nginx) and forward your
+# 3. Set WEBSHARE_TOKEN to your Webshare residential proxy token
+#    (format `USERNAME-PASSWORD`, a dash not a colon). Without it,
+#    Reddit CDN-level blocks the VPS's datacenter IP within hours
+#    of polling cadence. Sign up at https://webshare.io
+#    (~$3.50/month for 1GB, plenty for Popping's cadence).
+# 4. Bind to localhost only — terminate TLS at your existing
+#    reverse proxy (Caddy / Traefik / nginx / NPM) and forward your
 #    chosen proxy hostname to 127.0.0.1:3001.
-# 4. **Run the WARP host setup once on the VPS before starting the
-#    container** — see README "Host setup". The container's egress
-#    is routed through the host's WARP tun by an iptables rule that
-#    matches the docker bridge subnet, so all Reddit requests leave
-#    from a Cloudflare egress IP. Without the host setup the
-#    container starts and listens, but Reddit returns 403.
 
 services:
   popping-proxy:
@@ -33,11 +32,9 @@ services:
     # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
     pull_policy: always
-    # No cap_add / device_cgroup_rules / sysctls here. WARP runs on
-    # the host, not in this container; the container is a plain Bun
-    # app and runs as USER bun. Its only special requirement is the
-    # network path out, which the host's iptables mangle rule
-    # (added by the host setup) takes care of.
+    # Plain Bun app. No WARP, no caps, no sysctls — Reddit traffic
+    # is routed through the Webshare HTTP proxy via Bun's fetch
+    # `proxy` option.
     environment:
       PORT: "3001"
       # Reddit wants a real contact in the UA. The default below is
@@ -48,10 +45,17 @@ services:
       USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy)"
       # 2 req/s sustained, 4 burst. Popping's cross-ref sweep fires
       # ~50 requests in a tight loop; the limiter spreads them out
-      # so Reddit sees a polite cadence.
+      # so Webshare (and Reddit) sees a polite cadence.
       RATE_SUSTAINED: "2"
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
+      # Webshare residential proxy pool. The token they issue
+      # (`USERNAME-PASSWORD`, dash not colon) gets split on the
+      # first dash and re-stitched as `http://user:pass@p.webshare.io:80`,
+      # passed to Bun's `fetch` via the `proxy` option. Without
+      # this, requests go direct from the VPS and Reddit CDN-blocks
+      # the datacenter IP within hours of polling cadence.
+      WEBSHARE_TOKEN: "username-password"
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:

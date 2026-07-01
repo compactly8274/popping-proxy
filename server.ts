@@ -96,20 +96,40 @@ const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
 
-// All Reddit requests are routed through Cloudflare WARP via the
-// host's tun interface. WARP runs on the VPS host (not in this
-// container); a split-tunnel iptables rule on the host matches this
-// container's egress by source IP and pushes it through the WARP tun.
-// So we just `fetch` directly — the kernel routes the packets via
-// the host's policy, MASQUE-encapsulates them to Cloudflare's edge,
-// and Reddit's CDN sees a Cloudflare egress IP, which it does not
-// blocklist.
+// Webshare residential proxy pool. When WEBSHARE_TOKEN is set, every
+// Reddit request is routed through Webshare's rotating residential
+// IP pool. The token format is `USERNAME-PASSWORD` (a dash, not a
+// colon — Webshare's static proxy endpoint takes basic auth, not a
+// bearer token). The proxy URL is built from that pair against
+// p.webshare.io:80. Cost: ~$3.50/month for 1GB bandwidth, which
+// covers Popping's polling cadence for years.
 //
-// Why WARP: the proxy VPS's egress IP is on Reddit's CDN blocklist
-// (datacenter range, prior-tenant flag, or CGNAT reputation —
-// indistinguishable from the outside). WARP gives the request a
-// Cloudflare egress IP, which Reddit's CDN serves as regular
-// residential traffic. Free, no account, no token. See README.
+// When unset, requests go direct from the proxy VPS to Reddit. That
+// works for a while on a fresh VPS IP, but Reddit CDN-level blocks
+// most datacenter ranges within hours of polling cadence, so a
+// production deploy should always set this.
+//
+// Why Webshare and not WARP: in-container WARP's closed-source
+// 2026.6.x daemon establishes a MASQUE tunnel but never plumbs a
+// tun in restricted container environments (verified: ip link
+// inside the container showed only lo + eth0 after warp-cli connect
+// returned Success; kernel default route still via eth0). Host-level
+// WARP would work, but the install + split-tunnel rule + per-reboot
+// restore is a lot of moving parts. Webshare is two env vars and
+// one Bun fetch option.
+const WEBSHARE_TOKEN = (process.env.WEBSHARE_TOKEN ?? "").trim();
+const WEBSHARE_PROXY_URL = WEBSHARE_TOKEN
+  ? (() => {
+      // Webshare's static proxy format: http://USERNAME:PASSWORD@p.webshare.io:80
+      // The token they issue is `USERNAME-PASSWORD`; we split on the
+      // first dash and rejoin with `:` for the URL.
+      const dash = WEBSHARE_TOKEN.indexOf("-");
+      if (dash < 1 || dash === WEBSHARE_TOKEN.length - 1) return null;
+      const user = WEBSHARE_TOKEN.slice(0, dash);
+      const pass = WEBSHARE_TOKEN.slice(dash + 1);
+      return `http://${user}:${pass}@p.webshare.io:80`;
+    })()
+  : null;
 
 const VERSION = "1.0.0";
 
@@ -166,12 +186,12 @@ async function fetchReddit(path: string): Promise<Response> {
   const url = `https://www.reddit.com${path}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
-  // Egress goes through the host's WARP tun. The iptables rule on
-  // the host (added by the host setup) matches this container's
-  // source IP and routes the packets via the WARP tun. We don't
-  // configure a proxy here — the WARP tun is the default route for
-  // the container's outbound traffic by host policy.
-  const init: RequestInit = {
+  // Bun's fetch accepts a `proxy` option (string URL) for HTTP
+  // CONNECT-style proxying. When WEBSHARE_PROXY_URL is set we route
+  // through Webshare's residential pool; when null, we go direct.
+  // Bun's option type is `proxy?: string`, so we pass it only when
+  // defined to avoid sending `proxy: undefined`.
+  const init: RequestInit & { proxy?: string } = {
     headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     signal: ctrl.signal,
     // No follow-redirects option needed; Reddit's `.json` endpoints
@@ -179,6 +199,9 @@ async function fetchReddit(path: string): Promise<Response> {
     // same host. Bun's fetch follows redirects by default which is
     // what we want here.
   };
+  if (WEBSHARE_PROXY_URL) {
+    init.proxy = WEBSHARE_PROXY_URL;
+  }
   try {
     return await fetch(url, init);
   } finally {
@@ -381,6 +404,9 @@ const server = Bun.serve({
   },
 });
 
+const route = WEBSHARE_PROXY_URL
+  ? `Webshare residential pool (token set)`
+  : `direct (no WEBSHARE_TOKEN; expect 403s on datacenter IPs)`;
 console.log(
-  `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: host WARP tun -> Cloudflare egress)`,
+  `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: ${route})`,
 );
