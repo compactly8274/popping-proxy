@@ -96,19 +96,22 @@ const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
 
-// All Reddit requests are routed through Cloudflare WARP's local
-// SOCKS5 listener (127.0.0.1:40000). WARP is brought up in the
-// container's entrypoint.sh; if that socket isn't listening, the
-// entrypoint refuses to start the proxy at all (so this URL is
-// always reachable in practice — the env-var indirection is gone
-// because there's no "no WARP" supported mode).
+// All Reddit requests are routed through Cloudflare WARP via the
+// tun interface that warp-svc brings up. The 2026.6.x client is
+// MASQUE-based and does NOT expose a userspace SOCKS5 listener in
+// proxy mode (verified: ss -tlnp shows no listener on 40000/40001/
+// 1080/etc after `warp-cli connect` returns Success; only the tun
+// is up). So we don't tell Bun to use a SOCKS5 proxy — we just
+// `fetch` directly, and the container's default route is the
+// WARP tun, which MASQUE-encapsulates everything to Cloudflare's
+// edge. Reddit's CDN sees a Cloudflare egress IP, which it does
+// not blocklist.
 //
 // Why WARP: the proxy VPS's egress IP is on Reddit's CDN blocklist
 // (datacenter range, prior-tenant flag, or CGNAT reputation —
 // indistinguishable from the outside). WARP gives the request a
 // Cloudflare egress IP, which Reddit's CDN serves as regular
 // residential traffic. Free, no account, no token. See README.
-const WARP_SOCKS5_URL = "socks5://127.0.0.1:40000";
 
 const VERSION = "1.0.0";
 
@@ -165,12 +168,12 @@ async function fetchReddit(path: string): Promise<Response> {
   const url = `https://www.reddit.com${path}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
-  // Bun's fetch accepts a `proxy` option (string URL) for HTTP
-  // CONNECT-style proxying. WARP_SOCKS5_URL is the SOCKS5 endpoint
-  // brought up by the container entrypoint. SOCKS5 works for the
-  // HTTPS .json endpoints; we don't need CONNECT-with-TLS-passthrough
-  // or any of the more exotic modes.
-  const init: RequestInit & { proxy?: string } = {
+  // Egress goes through the WARP tun (the container's default route
+  // is set to the tun by the entrypoint; warp-svc's MASQUE tunnel
+  // does the encapsulation). We deliberately do NOT set `proxy` here
+  // — the 2026.6.x daemon doesn't bring up a userspace SOCKS5
+  // listener in proxy mode, so a SOCKS5 URL would just hang.
+  const init: RequestInit = {
     headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
     signal: ctrl.signal,
     // No follow-redirects option needed; Reddit's `.json` endpoints
@@ -178,9 +181,6 @@ async function fetchReddit(path: string): Promise<Response> {
     // same host. Bun's fetch follows redirects by default which is
     // what we want here.
   };
-  if (WARP_SOCKS5_URL) {
-    init.proxy = WARP_SOCKS5_URL;
-  }
   try {
     return await fetch(url, init);
   } finally {
@@ -370,5 +370,5 @@ const server = Bun.serve({
 });
 
 console.log(
-  `popping-proxy ${VERSION} listening on :${server.port} (routing: WARP socks5 -> 127.0.0.1:40000)`,
+  `popping-proxy ${VERSION} listening on :${server.port} (routing: WARP tun -> Cloudflare MASQUE egress)`,
 );

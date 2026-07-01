@@ -168,10 +168,10 @@ log "warp-cli: connected"
 # the next entrypoint should be polling for. This block is intentionally
 # noisy; it always runs after a successful connect, before the SOCKS5
 # wait fails. Remove once the right port is identified.
-log "diag: --- warp-cli status ---"
-warp-cli --accept-tos status 2>&1 | sed 's/^/[entrypoint] diag: /'
-log "diag: --- warp-cli settings ---"
-warp-cli --accept-tos settings 2>&1 | sed 's/^/[entrypoint] diag: /'
+log "diag: --- tun interface ---"
+ip -o link show 2>&1 | sed 's/^/[entrypoint] diag: /'
+log "diag: --- routes ---"
+ip route show 2>&1 | sed 's/^/[entrypoint] diag: /'
 log "diag: --- listening sockets ---"
 ss -tlnp 2>&1 | sed 's/^/[entrypoint] diag: /'
 log "diag: --- port probes ---"
@@ -185,22 +185,34 @@ done
 log "diag: --- last 5 warp-svc log lines ---"
 tail -5 /tmp/warp-svc.log 2>/dev/null | sed 's/^/[entrypoint] diag: /' || true
 
-# --- 8. Wait for the SOCKS5 socket ------------------------------------------
-# The SOCKS5 listener is on 127.0.0.1:40000 once the tunnel is up.
-# `nc -z` (from netcat-openbsd, the default on debian-slim) does a
-# zero-I/O connect probe and exits 0 on success. Poll until it
-# succeeds or we time out. POSIX-portable deadline arithmetic.
-deadline=$(( $(date +%s) + 30 ))
-while ! nc -z 127.0.0.1 40000 2>/dev/null; do
+# --- 8. Wait for the WARP tun interface -------------------------------------
+# The 2026.6.x daemon uses MASQUE (HTTP/3 over QUIC) for the tunnel
+# and does NOT bring up a userspace SOCKS5 listener in proxy mode.
+# Egress is routed via the WARP tun (typically `CloudflareWARP`),
+# which warp-svc configures automatically when `warp-cli connect`
+# returns. The interface is created with `ip link add`; we just
+# need to wait for it to appear and be UP before exec'ing bun, so
+# that bun's first `fetch` actually goes through the tunnel.
+#
+# ip -o link show prints one line per interface, with the state in
+# column 2 (UNKNOWN/UP/DOWN/...). Match the WARP interface name
+# (case-insensitive substring `cloudflare` or `warp`) and require
+# the state to be UP. Poll for up to 15s, then proceed (the
+# previous SOCKS5-wait was 30s; tun bring-up is typically <1s).
+deadline=$(( $(date +%s) + 15 ))
+while :; do
+    if ip -o link show 2>/dev/null | awk '{print $2, $9}' | grep -iE '^(cloudflare|warp)' | grep -q UP; then
+        break
+    fi
     if [ $(date +%s) -ge $deadline ]; then
-        log "warp-cli: SOCKS5 not listening on 127.0.0.1:40000 after 30s"
-        log "warp-cli: --- last 20 log lines ---"
+        log "warp: tun interface not up after 15s"
+        log "warp: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
-        fail "WARP SOCKS5 proxy never came up"
+        fail "WARP tun interface never came up"
     fi
     sleep 0.5
 done
-log "warp-cli: socks5 ready on 127.0.0.1:40000"
+log "warp-cli: tun interface up (routing through MASQUE egress)"
 
 # --- 8. Drop privs, exec bun -----------------------------------------------
 # `su` from util-linux (installed by the `passwd` package, which
