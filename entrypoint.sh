@@ -44,8 +44,12 @@ log "warp-svc: pid=$WARP_PID"
 # warp-cli talks to warp-svc over a Unix socket under /var/run/.
 # Poll for the socket file (with a timeout) so we don't race the
 # daemon's startup.
-deadline=$((SECONDS + 30))
-while [ ! -S /var/run/cloudflare-warp/warp-svc.sock ] && [ $SECONDS -lt $deadline ]; do
+#
+# `SECONDS` is a bash-ism; on debian /bin/sh is dash and doesn't
+# define it. Use date +%s arithmetic instead — POSIX-portable.
+deadline=$(( $(date +%s) + 30 ))
+while [ ! -S /var/run/cloudflare-warp/warp-svc.sock ] \
+    && [ $(date +%s) -lt $deadline ]; do
     sleep 0.2
 done
 if [ ! -S /var/run/cloudflare-warp/warp-svc.sock ]; then
@@ -94,9 +98,9 @@ fi
 # only accepts the new form. UDP is not supported in proxy mode
 # — Reddit's .json endpoints are HTTPS/TCP, so that's fine.
 log "warp-cli: setting proxy mode"
-warp-cli mode proxy
+warp-cli mode proxy >/dev/null
 log "warp-cli: setting proxy port to 40000"
-warp-cli proxy port 40000
+warp-cli proxy port 40000 >/dev/null
 
 # --- 5. Connect -------------------------------------------------------------
 log "warp-cli: connecting"
@@ -112,10 +116,10 @@ log "warp-cli: connected"
 # The SOCKS5 listener is on 127.0.0.1:40000 once the tunnel is up.
 # `nc -z` (from netcat-openbsd, the default on debian-slim) does a
 # zero-I/O connect probe and exits 0 on success. Poll until it
-# succeeds or we time out.
-deadline=$((SECONDS + 30))
+# succeeds or we time out. POSIX-portable deadline arithmetic.
+deadline=$(( $(date +%s) + 30 ))
 while ! nc -z 127.0.0.1 40000 2>/dev/null; do
-    if [ $SECONDS -ge $deadline ]; then
+    if [ $(date +%s) -ge $deadline ]; then
         log "warp-cli: SOCKS5 not listening on 127.0.0.1:40000 after 30s"
         log "warp-cli: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
