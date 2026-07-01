@@ -110,11 +110,14 @@ log "warp-svc: grace period elapsed, proceeding"
 # loud rather than wait indefinitely.
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
     log "warp-cli: registering (anonymous)"
-    # NOTE: --accept-tos is a `warp-svc` flag (passed in step 2 above).
-    # It is NOT a `warp-cli registration new` flag — clap rejects it
-    # there as "unexpected argument". TOS is accepted at the daemon
-    # level once, and `warp-cli` subcommands don't re-prompt.
-    if ! timeout 60 warp-cli registration new; then
+    # NOTE: --accept-tos is a GLOBAL `warp-cli` flag — it goes BEFORE
+    # the subcommand (`warp-cli --accept-tos registration new`), not
+    # after. clap parses it as an option on the top-level `warp-cli`
+    # command; on a subcommand (`registration new`), it errors out
+    # with "unexpected argument '--accept-tos'". The daemon is
+    # already started with --accept-tos in step 2, but warp-cli
+    # also re-checks TOS on every call as a CLI guardrail.
+    if ! timeout 60 warp-cli --accept-tos registration new; then
         log "warp-cli: registration failed or timed out"
         log "warp-cli: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
@@ -139,9 +142,9 @@ fi
 # only accepts the new form. UDP is not supported in proxy mode
 # — Reddit's .json endpoints are HTTPS/TCP, so that's fine.
 log "warp-cli: setting proxy mode"
-warp-cli mode proxy >/dev/null
+warp-cli --accept-tos mode proxy >/dev/null
 log "warp-cli: setting proxy port to 40000"
-warp-cli proxy port 40000 >/dev/null
+warp-cli --accept-tos proxy port 40000 >/dev/null
 
 # --- 6. Connect -------------------------------------------------------------
 # 60s timeout: the WARP handshake + tunnel bring-up is normally
@@ -149,7 +152,7 @@ warp-cli proxy port 40000 >/dev/null
 # complete in 60s, the WireGuard tunnel is failing silently and
 # the SOCKS5 listener will never come up.
 log "warp-cli: connecting"
-if ! timeout 60 warp-cli connect; then
+if ! timeout 60 warp-cli --accept-tos connect; then
     log "warp-cli: connect failed or timed out"
     log "warp-cli: --- last 20 log lines ---"
     tail -20 /tmp/warp-svc.log 2>/dev/null || true
