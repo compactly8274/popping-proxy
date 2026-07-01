@@ -253,13 +253,20 @@ const server = Bun.serve({
       );
       await takeToken();
       let upstream: Response;
+      const reqPath = `/r/${sub}/${listing}?limit=${limit}`;
       try {
         upstream = await fetchReddit(
           `/r/${encodeURIComponent(sub)}/${encodeURIComponent(listing)}.json?limit=${limit}`,
         );
       } catch (e) {
+        console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
         return errorResponse(502, "upstream_unreachable", String(e));
       }
+      const upCT = upstream.headers.get("content-type") ?? "?";
+      const upLen = upstream.headers.get("content-length") ?? "?";
+      console.log(
+        `[upstream] ${reqPath} -> ${upstream.status} (ct=${upCT}, len=${upLen})`,
+      );
       if (!upstream.ok) {
         const text = await upstream.text().catch(() => "");
         const headers: Record<string, string> = {};
@@ -299,13 +306,20 @@ const server = Bun.serve({
       await takeToken();
       const q = `url:${target}`;
       let upstream: Response;
+      const reqPath = `/search?url=${target.slice(0, 80)}`;
       try {
         upstream = await fetchReddit(
           `/search.json?q=${encodeURIComponent(q)}&limit=1&sort=relevance&restrict_sr=&type=link`,
         );
       } catch (e) {
+        console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
         return errorResponse(502, "upstream_unreachable", String(e));
       }
+      const upCT = upstream.headers.get("content-type") ?? "?";
+      const upLen = upstream.headers.get("content-length") ?? "?";
+      console.log(
+        `[upstream] ${reqPath} -> ${upstream.status} (ct=${upCT}, len=${upLen})`,
+      );
       if (!upstream.ok) {
         const text = await upstream.text().catch(() => "");
         return errorResponse(upstream.status, "upstream_error", text.slice(0, 500));
