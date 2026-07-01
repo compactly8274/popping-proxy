@@ -110,7 +110,11 @@ log "warp-svc: grace period elapsed, proceeding"
 # loud rather than wait indefinitely.
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
     log "warp-cli: registering (anonymous)"
-    if ! timeout 60 warp-cli registration new --accept-tos; then
+    # NOTE: --accept-tos is a `warp-svc` flag (passed in step 2 above).
+    # It is NOT a `warp-cli registration new` flag — clap rejects it
+    # there as "unexpected argument". TOS is accepted at the daemon
+    # level once, and `warp-cli` subcommands don't re-prompt.
+    if ! timeout 60 warp-cli registration new; then
         log "warp-cli: registration failed or timed out"
         log "warp-cli: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
