@@ -128,23 +128,29 @@ else
     log "warp-cli: already registered (skipping)"
 fi
 
-# --- 5. Set proxy mode ------------------------------------------------------
-# Proxy mode is the critical bit: it opens 127.0.0.1:40000 as a
-# SOCKS5 endpoint that Bun's fetch can use directly, without
-# taking over the container's network namespace. TUN mode would
-# route the whole container's traffic through Cloudflare, which
-# we don't want.
+# --- 5. Set warp mode -------------------------------------------------------
+# TUN mode (a.k.a. "warp" mode) brings up a WireGuard-style tun
+# interface inside the container and routes all egress through it.
+# This is the mode that actually puts traffic on a Cloudflare IP —
+# "proxy" mode in 2026.6.x is essentially a no-op for our use
+# case: it spins up a userspace MASQUE connection in the daemon
+# but never creates a tun, so the container's default route still
+# goes via eth0 (verified: ip link show shows only lo + eth0 after
+# `warp-cli --accept-tos mode proxy` + connect; ss -tlnp shows no
+# SOCKS5 listener; the daemon says "Connected" but traffic doesn't
+# actually route through Cloudflare).
+#
+# Switching to mode warp — the daemon creates a `CloudflareWARP`
+# tun device, configures the default route to it, and DNS for
+# excluded domains (Docker's internal 127.0.0.11) is preserved.
+# Reddit's .json endpoints are HTTPS/TCP, so UDP is fine to drop.
 #
 # Note: the official warp-cli syntax changed in 2024. Newer
-# versions use `warp-cli mode proxy` + `warp-cli proxy port N`,
-# the older `set-mode` / `set-proxy-port` forms are deprecated.
-# The 2026.6.x client we install from pkg.cloudflareclient.com
-# only accepts the new form. UDP is not supported in proxy mode
-# — Reddit's .json endpoints are HTTPS/TCP, so that's fine.
-log "warp-cli: setting proxy mode"
-warp-cli --accept-tos mode proxy >/dev/null
-log "warp-cli: setting proxy port to 40000"
-warp-cli --accept-tos proxy port 40000 >/dev/null
+# versions use `warp-cli mode <mode>`, the older `set-mode` form
+# is deprecated. The 2026.6.x client we install from
+# pkg.cloudflareclient.com only accepts the new form.
+log "warp-cli: setting warp (TUN) mode"
+warp-cli --accept-tos mode warp >/dev/null
 
 # --- 6. Connect -------------------------------------------------------------
 # 60s timeout: the WARP handshake + tunnel bring-up is normally
