@@ -4,7 +4,7 @@ Tiny Reddit JSON proxy for the [Popping](https://example.com/popping) dashboard.
 
 Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll on a schedule. This proxy sits in front of Reddit on your VPS so all the dashboard's per-subreddit fetches and cross-reference searches leave one IP, with one rate limiter, instead of being scattered across wherever Popping happens to be running.
 
-**Routed through Cloudflare WARP.** Every Reddit request leaves the VPS through a Cloudflare egress IP, which Reddit's CDN serves as regular residential traffic (Cloudflare is also a Reddit CDN customer, so the IP class is implicitly trusted). WARP itself runs on the host with a split-tunnel iptables rule that only affects this container's egress — Caddy, other containers, and the host's own traffic stay direct. See **Host setup** below.
+**Routed through Cloudflare WARP.** Every Reddit request leaves the VPS through a Cloudflare egress IP, which Reddit's CDN serves as regular residential traffic (Cloudflare is also a Reddit CDN customer, so the IP class is implicitly trusted). WARP itself runs on the host with a split-tunnel policy-routing rule that only affects this container's egress — Caddy, other containers, and the host's own traffic stay direct. See **Host setup** below.
 
 **Optional with newer Popping.** As of `popping@6869d74` the backend can scrape Reddit's `.json` endpoints directly with a polite per-process token bucket. The proxy is still the recommended path for any deployment on a residential / datacenter IP that Reddit's anti-abuse flags, but a small personal instance on a home IP that hasn't been throttled yet will work fine without it. Run `python /app/scripts/reddit_reachability.py` inside `popping-backend-1` to probe whether direct mode will work from your IP.
 
@@ -157,7 +157,7 @@ docker exec popping-proxy-popping-proxy-1 \
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
 
-The proxy needs no Reddit-routing env var. WARP runs on the host; the proxy's egress is routed through the host's WARP tun by a split-tunnel iptables rule that matches the docker bridge subnet. See **Host setup** above.
+The proxy needs no Reddit-routing env var. WARP runs on the host; the proxy's egress is routed through the host's WARP tun by a split-tunnel `ip rule` + `ip route` that matches the docker bridge subnet. See **Host setup** above.
 
 ### User-Agent recommendations
 
@@ -175,41 +175,39 @@ Don't use: `python-requests`, `curl/7.x`, `httpx/0.x`, generic `<app>/<version>`
 
 ## How WARP routing works here
 
-[Cloudflare WARP](https://1.1.1.1/) is the same service that powers the 1.1.1.1 DNS resolver — it's a free, no-account VPN that routes your traffic through Cloudflare's network. WARP itself runs on the host (not in the proxy container), and a split-tunnel rule on the host makes the proxy container's egress the only traffic that goes through it.
+[Cloudflare WARP](https://1.1.1.1/) is the same service that powers the 1.1.1.1 DNS resolver — it's a free, no-account VPN that routes your traffic through Cloudflare's network. WARP itself runs on the host (not in the proxy container), and a split-tunnel `ip rule` on the host makes the proxy container's egress the only traffic that goes through it.
 
 ```
-+---------------------+        +-------------------+        +------------------+
-| popping-proxy       |        | VPS host          |        | Internet         |
-| (Bun, USER bun)     |        |                   |        |                  |
-|                     |        |  +-------------+  |        |                  |
-|  fetch() ---+       |        |  | iptables    |  |        |                  |
-|             |       |        |  | mangle:     |  |        |                  |
-|             v       |  --->  |  |  match src  |  |  --->  |  Cloudflare      |
-|           eth0      |        |  |  = docker   |  |        |  edge (MASQUE)   |
-|             |       |        |  |  bridge --+ |  |        |       |          |
-|             |       |        |  +-----------|--+  |        |       v          |
-|             |       |        |              |     |        |  Reddit CDN      |
-|             |       |        |              v     |        |  (sees CF IP)    |
-|             |       |        |  ip rule:   table 100    |        |                  |
-|             |       |        |  from $DOCKER_BRIDGE    |        |                  |
-|             |       |        |  lookup 100             |        |                  |
-|             |       |        |              |         |        |                  |
-|             |       |        |              v         |        |                  |
-|             |       |        |  ip route:  default    |        |                  |
-|             |       |        |  dev CloudflareWARP    |        |                  |
-|             |       |        |  table 100             |        |                  |
-|             |       |        |              |         |        |                  |
-|             |       |        |              v         |        |                  |
-|             |       |        |  CloudflareWARP (tun)  |        |                  |
-|             |       |        |       |                |        |                  |
-+---------------------+        +-------------------+        +------------------+
-                                Everything else on the host
-                                (Caddy, other containers, host's
-                                own traffic) is unaffected — only
-                                packets whose source IP is in the
-                                docker bridge subnet match the
-                                iptables mangle rule.
++---------------------+      +-----------------------+      +------------------+
+| popping-proxy       |      | VPS host              |      | Internet         |
+| (Bun, USER bun)     |      |                       |      |                  |
+|                     |      |  eth0 (host traffic)  |      |                  |
+|  fetch() --+        |      |     |                 |      |                  |
+|            |        |      |     v                 |      |                  |
+|            v        |      |  default route: eth0  |  --> |  Reddit/etc      |
+|          eth0       |  --> |     (direct egress)   |      |  (host IP)       |
+|            |        |      |                       |      |                  |
+|            |        |      |  docker bridge        |      |                  |
+|            |        |      |  172.21.0.0/16         |      |                  |
+|            |        |      |     |                 |      |                  |
+|            |        |      |     v                 |      |                  |
+|            |        |      |  ip rule:             |      |                  |
+|            |        |      |   from 172.21.0.0/16  |      |                  |
+|            |        |      |   lookup 100          |      |                  |
+|            |        |      |     |                 |      |                  |
+|            |        |      |     v                 |      |                  |
+|            |        |      |  ip route table 100:  |      |                  |
+|            |        |      |   default dev         |      |                  |
+|            |        |      |   CloudflareWARP      |  --> |  Cloudflare      |
+|            |        |      |                       |      |  edge (MASQUE)   |
++---------------------+      +-----------------------+      +------------------+
+                                                               |
+                                                               v
+                                                            Reddit CDN
+                                                            (sees CF IP)
 ```
+
+The trick is `ip rule`: when the host's routing stack sees a packet whose source IP is in the docker bridge subnet, it consults table 100 instead of the default main table. Table 100's only entry is `default dev CloudflareWARP`, so the packet goes into the WARP tun, gets MASQUE-encapsulated, and exits at Cloudflare's edge. Packets from any other source IP (Caddy, the host itself, other containers on different networks) take the default main table and exit via the host's eth0 — direct, unchanged.
 
 Why host-level WARP and not in-container WARP: the 2026.6.x `warp-svc` daemon is MASQUE-only and does not bring up a userspace SOCKS5 listener in proxy mode (verified: `ss -tlnp` after `warp-cli connect` shows no listener on 40000/40001/1080/etc), and the tun it creates in `mode warp` is in the host's network namespace, not the container's. The split-tunnel pattern above puts the tun where the container's packets actually pass through (the docker bridge / host routing stack), which is the only place the policy can be expressed.
 
@@ -226,8 +224,21 @@ docker exec popping-proxy-popping-proxy-1 \
 If `warp=off`, the host's split-tunnel rule isn't matching the container's source IP. Most common causes:
 
 - The docker bridge subnet changed (e.g. you recreated the `docker0` bridge). Re-run the `ip rule add from $DOCKER_BRIDGE …` line with the current subnet.
-- You're running the container in `network_mode: host` (then the source IP is the host's, not the docker bridge's, and you don't need the iptables rule at all — the host's WARP route catches it).
+- You're running the container in `network_mode: host` (then the source IP is the host's, not the docker bridge's, and you don't need the `ip rule` at all — the host's WARP route catches it).
 - `warp-cli status` shows `Disconnected`. Run `warp-cli connect` and check `systemctl status warp-svc`.
+
+**Nginx Proxy Manager (or another reverse proxy in a separate container) returns 502 with openresty's branding.** That branding means NPM's openresty could not get any HTTP response from the proxy upstream — the proxy container isn't reachable on the network NPM can see. This is **not** a WARP problem; it's a docker networking problem. The proxy listens on the docker bridge network on port 3001; NPM needs to be on the same docker network and configured to use the proxy's container/service name as the upstream (not `127.0.0.1`, which is NPM's own loopback). Concretely:
+
+```sh
+# On the VPS, with both containers running:
+docker network create --driver bridge shared 2>/dev/null || true
+docker network connect shared popping-proxy-popping-proxy-1
+docker network connect shared <your-npm-container>
+# Then in the NPM web UI, change the upstream from 127.0.0.1:3001
+# to <proxy-container-name>:3001 and Save.
+```
+
+Confirm with: `docker exec <npm-container> wget -qO- --timeout=5 http://<proxy-container>:3001/healthz` should return `{"ok":true,"version":"1.0.0"}`.
 
 **`warp-cli registration new` hangs.** The WARP registration endpoint (`api.cloudflareclient.com`) needs outbound HTTPS. If your VPS's egress firewall blocks it, registration times out. Open it temporarily or use a host with less restrictive egress rules.
 

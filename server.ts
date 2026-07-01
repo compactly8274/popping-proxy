@@ -243,8 +243,22 @@ function errorResponse(
 
 const server = Bun.serve({
   port: PORT,
+  // Bind to 0.0.0.0 explicitly so the container accepts connections
+  // on the docker bridge network (where NPM reaches us from the
+  // shared network). Bun's default is 0.0.0.0 too, but spelling it
+  // out here makes it explicit and immune to a future default change.
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
+
+    // Log every request the handler receives. Cheap, and the
+    // difference between "no [req] line" (handler never got the
+    // request) and "[req] but no [upstream] line" (handler got it
+    // but the fetch is stuck) is the difference between an NPM/
+    // network problem and a WARP/routing problem. Both are
+    // possible failure modes; logging both ends of the request
+    // disambiguates them.
+    console.log(`[req] ${req.method} ${url.pathname}${url.search}`);
 
     // Health probe. Cheaper than a 404 and lets the reverse proxy /
     // orchestrator know we're alive. Returns before the rate
@@ -368,5 +382,5 @@ const server = Bun.serve({
 });
 
 console.log(
-  `popping-proxy ${VERSION} listening on :${server.port} (routing: host WARP tun -> Cloudflare egress)`,
+  `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: host WARP tun -> Cloudflare egress)`,
 );
