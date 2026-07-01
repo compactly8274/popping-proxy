@@ -65,7 +65,11 @@ log "warp-svc: control socket ready"
 # "TOS not accepted" error.
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
     log "warp-cli: registering (anonymous)"
-    if ! warp-cli --accept-tos registration new; then
+    # --accept-tos: the WARP client requires explicit TOS acceptance
+    # since 2024. Without it `registration new` exits non-zero with a
+    # "TOS not accepted" error. Subcommand form (rather than the
+    # global --accept-tos) is what the official docs use.
+    if ! warp-cli registration new --accept-tos; then
         log "warp-cli: registration failed"
         log "warp-cli: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
@@ -82,8 +86,17 @@ fi
 # taking over the container's network namespace. TUN mode would
 # route the whole container's traffic through Cloudflare, which
 # we don't want.
+#
+# Note: the official warp-cli syntax changed in 2024. Newer
+# versions use `warp-cli mode proxy` + `warp-cli proxy port N`,
+# the older `set-mode` / `set-proxy-port` forms are deprecated.
+# The 2026.6.x client we install from pkg.cloudflareclient.com
+# only accepts the new form. UDP is not supported in proxy mode
+# — Reddit's .json endpoints are HTTPS/TCP, so that's fine.
 log "warp-cli: setting proxy mode"
-warp-cli set-mode proxy >/dev/null
+warp-cli mode proxy
+log "warp-cli: setting proxy port to 40000"
+warp-cli proxy port 40000
 
 # --- 5. Connect -------------------------------------------------------------
 log "warp-cli: connecting"
@@ -97,8 +110,9 @@ log "warp-cli: connected"
 
 # --- 6. Wait for the SOCKS5 socket ------------------------------------------
 # The SOCKS5 listener is on 127.0.0.1:40000 once the tunnel is up.
-# busybox `nc -z` does a zero-I/O connect probe and exits 0 on
-# success. Poll until it succeeds or we time out.
+# `nc -z` (from netcat-openbsd, the default on debian-slim) does a
+# zero-I/O connect probe and exits 0 on success. Poll until it
+# succeeds or we time out.
 deadline=$((SECONDS + 30))
 while ! nc -z 127.0.0.1 40000 2>/dev/null; do
     if [ $SECONDS -ge $deadline ]; then
@@ -112,8 +126,10 @@ done
 log "warp-cli: socks5 ready on 127.0.0.1:40000"
 
 # --- 7. Drop privs, exec bun -----------------------------------------------
-# busybox `su` is fine for this. The `exec` replaces the shell so
-# the bun process becomes PID 1 inside the container and receives
+# `su` from util-linux (installed by the `passwd` package, which
+# the cloudflare-warp deb pulls in transitively) handles the
+# user switch fine. The `exec` replaces the shell so the bun
+# process becomes PID 1 inside the container and receives
 # signals (SIGTERM from `docker stop`, etc.) directly.
 log "exec: dropping to user bun, starting server.ts"
 exec su -s /bin/sh bun -c 'exec bun run server.ts'

@@ -1,10 +1,25 @@
-FROM oven/bun:1.1-alpine
-# cloudflare-warp is in Alpine 3.21 community repo. The package
-# pulls warp-svc + warp-cli. iptables is a runtime dep for the
-# tunnel setup; some alpine builds don't auto-pull it. We install
-# it explicitly so the first boot doesn't fail with a missing
-# iptables-restore.
-RUN apk add --no-cache cloudflare-warp iptables
+FROM oven/bun:1.1-debian
+# Cloudflare WARP ships a closed-source daemon (warp-svc) that is
+# dynamically linked against glibc, nss, dbus, etc. — it does NOT
+# run on Alpine's musl libc, so we have to use the debian base.
+# The .deb is fetched from Cloudflare's own apt repo at
+# pkg.cloudflareclient.com; we add the GPG key, the source list,
+# and apt-get install the package. iptables is a runtime dep
+# pulled in by cloudflare-warp but we list it explicitly so a
+# future deb change that drops it doesn't break the entrypoint.
+ARG DEBIAN_FRONTEND=noninteractive
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg iptables lsb-release; \
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+        | gpg --dearmor \
+        -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com $(lsb_release -cs) main" \
+        > /etc/apt/sources.list.d/cloudflare-client.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends cloudflare-warp; \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json ./
 COPY server.ts ./

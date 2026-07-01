@@ -167,12 +167,15 @@ docker build -t popping-proxy:dev .
 docker run --rm --cap-add=NET_ADMIN -p 127.0.0.1:3001:3001 popping-proxy:dev
 ```
 
-The Dockerfile is a small `oven/bun:1.1-alpine` base that installs
-`cloudflare-warp`, copies the server file and the entrypoint script
-in, and runs the entrypoint as root (warp-svc needs `CAP_NET_ADMIN`).
-The entrypoint brings up WARP, then drops privileges to the
-unprivileged `bun` user before exec'ing the server. `--cap-add=NET_ADMIN`
-is required when running locally too.
+The Dockerfile is a small `oven/bun:1.1-debian` base that installs
+`cloudflare-warp` from Cloudflare's official apt repo, copies the
+server file and the entrypoint script in, and runs the entrypoint
+as root (warp-svc needs `CAP_NET_ADMIN`). The entrypoint brings
+up WARP, then drops privileges to the unprivileged `bun` user
+before exec'ing the server. `--cap-add=NET_ADMIN` is required
+when running locally too. We use the debian base, not alpine,
+because WARP's `warp-svc` is a closed-source glibc-linked
+binary and does not run on musl.
 
 ## License
 
