@@ -85,35 +85,36 @@ warp-svc --accept-tos >/tmp/warp-svc.log 2>&1 &
 WARP_PID=$!
 log "warp-svc: pid=$WARP_PID"
 
-# --- 3. Wait for the daemon to be reachable via warp-cli --------------------
-# Instead of polling for a specific socket file (whose name we
-# don't know for certain across versions), poll the daemon with
-# `warp-cli status` — that command blocks on the IPC and gives
-# us an authoritative "ready" signal. POSIX-portable deadline
-# arithmetic.
-deadline=$(( $(date +%s) + 30 ))
-while ! warp-cli status >/dev/null 2>&1; do
-    if [ $(date +%s) -ge $deadline ]; then
-        log "warp-cli: daemon not responding to status queries after 30s"
-        log "warp-cli: --- last 20 log lines ---"
-        tail -20 /tmp/warp-svc.log 2>/dev/null || true
-        fail "warp-svc did not become ready"
-    fi
-    sleep 0.5
-done
-log "warp-svc: responding to status queries"
+# --- 3. Brief wait + let the next warp-cli call be the readiness probe ---
+# The reference cmj2002/warp-docker entrypoint uses a fixed
+# sleep here ("WARP_SLEEP=2") on the grounds that warp-cli
+# itself blocks on the IPC until the daemon is ready, so the
+# first real `warp-cli` call (registration new, below) acts as
+# a natural readiness probe — it won't return until the daemon
+# is listening, or it'll fail with a connection error.
+#
+# We add a 2-second sleep to avoid race conditions where warp-svc
+# has started its IPC layer but the `reg.json` check below would
+# otherwise see a stale or partial state. POSIX-portable.
+sleep 2
+log "warp-svc: grace period elapsed, proceeding"
 
 # --- 4. Register the client (anonymous, one-time) ---------------------------
 # /var/lib/cloudflare-warp/reg.json is written on a successful
 # registration. Skip the call if the file already exists so
 # container restarts don't churn the client identity.
+# We wrap the call in `timeout 60` (from coreutils) so a hung
+# daemon doesn't make the entrypoint hang forever — if the
+# daemon isn't accepting IPC by 60s after the 2s grace period
+# in step 3, something is structurally wrong and we should fail
+# loud rather than wait indefinitely.
 if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
     log "warp-cli: registering (anonymous)"
-    if ! warp-cli registration new --accept-tos; then
-        log "warp-cli: registration failed"
+    if ! timeout 60 warp-cli registration new --accept-tos; then
+        log "warp-cli: registration failed or timed out"
         log "warp-cli: --- last 20 log lines ---"
         tail -20 /tmp/warp-svc.log 2>/dev/null || true
-        fail "warp-cli registration new exited non-zero"
+        fail "warp-cli registration new did not complete within 60s"
     fi
     log "warp-cli: registered"
 else
@@ -139,12 +140,16 @@ log "warp-cli: setting proxy port to 40000"
 warp-cli proxy port 40000 >/dev/null
 
 # --- 6. Connect -------------------------------------------------------------
+# 60s timeout: the WARP handshake + tunnel bring-up is normally
+# 5-15s but can be longer on a fresh registration. If it doesn't
+# complete in 60s, the WireGuard tunnel is failing silently and
+# the SOCKS5 listener will never come up.
 log "warp-cli: connecting"
-if ! warp-cli connect; then
-    log "warp-cli: connect failed"
+if ! timeout 60 warp-cli connect; then
+    log "warp-cli: connect failed or timed out"
     log "warp-cli: --- last 20 log lines ---"
     tail -20 /tmp/warp-svc.log 2>/dev/null || true
-    fail "warp-cli connect exited non-zero"
+    fail "warp-cli connect did not complete within 60s"
 fi
 log "warp-cli: connected"
 
