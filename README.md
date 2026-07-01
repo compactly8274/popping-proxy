@@ -90,8 +90,8 @@ To restore the split-tunnel rule on reboot, drop the snippet the script prints a
 docker run -d --name popping-proxy \
   --restart unless-stopped \
   -p 127.0.0.1:3001:3001 \
-  -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
-  ghcr.io/<owner>/popping-proxy:latest
+  -e USER_AGENT="popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy; contact: phil@philjnewman.com)" \
+  ghcr.io/compactly8274/popping-proxy:latest
 ```
 
 No `--cap-add`, no `--device-cgroup-rule`, no `--sysctl` — the container is a plain Bun app. WARP and all its kernel requirements live on the host.
@@ -101,9 +101,10 @@ No `--cap-add`, no `--device-cgroup-rule`, no `--sysctl` — the container is a 
 A `docker-compose.yml` is included. It pulls the pre-built image by default; uncomment the `build: .` line if you want to compile from source.
 
 ```sh
-git clone https://github.com/<owner>/popping-proxy.git
+git clone https://github.com/compactly8274/popping-proxy.git
 cd popping-proxy
-# Edit docker-compose.yml: replace <owner> in the image: line, set USER_AGENT
+# Edit docker-compose.yml only if you're forking — the shipped file
+# already points at the canonical GHCR image and a real contact UA.
 docker compose up -d
 ```
 
@@ -165,7 +166,7 @@ Reddit's anti-abuse throttles aggressively on UAs that look like a script. Use a
 
 ```
 # Best — real project URL + real contact email
-popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)
+popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy; contact: phil@philjnewman.com)
 
 # Acceptable — domain you control that points at a page describing the proxy
 popping-proxy/1.0 (+https://reddit.yourdomain.com; contact: you@yourdomain.com)

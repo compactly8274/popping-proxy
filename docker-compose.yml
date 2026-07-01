@@ -10,10 +10,11 @@
 #
 # Required env / setup
 # --------------------
-# 1. Replace `<owner>` in the `image:` line with the GitHub user
-#    or org that hosts this repo (the GHCR image lives at
-#    ghcr.io/<owner>/popping-proxy).
-# 2. Set USER_AGENT below to a real contact string. Reddit's
+# The defaults in this file assume the canonical deploy: image
+# pulled from `ghcr.io/compactly8274/popping-proxy` and a contact
+# UA pointing at phil@philjnewman.com. Fork deploys should:
+# 1. Change the `image:` line to your own GHCR namespace.
+# 2. Override USER_AGENT to your own contact string. Reddit's
 #    anti-abuse will 403 you within hours of polling cadence if
 #    the UA is generic. The pattern Reddit's docs recommend is
 #    `<app>/<version> (+<project-url>; contact: <real-email>)`.
@@ -29,7 +30,7 @@
 
 services:
   popping-proxy:
-    image: ghcr.io/<owner>/popping-proxy:latest
+    image: ghcr.io/compactly8274/popping-proxy:latest
     # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
     pull_policy: always
@@ -45,7 +46,11 @@ services:
       # the first few requests but get 403'd within hours. Replace
       # with the recommended pattern before going live:
       #   USER_AGENT: "popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)"
-      USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy)"
+      # Set to a real contact string. Reddit's anti-abuse 403s
+      # generic UAs within hours of polling cadence. The pattern
+      # Reddit's docs recommend is:
+      #   <app>/<version> (+<project-url>; contact: <real-email>)
+      USER_AGENT: "popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy; contact: phil@philjnewman.com)"
       # 2 req/s sustained, 4 burst. Popping's cross-ref sweep fires
       # ~50 requests in a tight loop; the limiter spreads them out
       # so Reddit sees a polite cadence.
