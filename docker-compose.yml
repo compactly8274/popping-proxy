@@ -27,6 +27,14 @@ services:
     # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
     pull_policy: always
+    # Cloudflare WARP runs in the container as warp-svc. It needs
+    # CAP_NET_ADMIN to create the WireGuard tun device, even in
+    # proxy mode (the daemon still creates the tun; it just doesn't
+    # route the host's traffic through it). Without this cap the
+    # entrypoint fails fast on the SOCKS5 wait and the container
+    # restarts — visible in `docker logs`.
+    cap_add:
+      - NET_ADMIN
     environment:
       PORT: "3001"
       # Reddit wants a real contact in the UA. The default below is
@@ -41,13 +49,9 @@ services:
       RATE_SUSTAINED: "2"
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
-      # Webshare residential proxy pool. Set this to your Webshare
-      # token (`USERNAME-PASSWORD` form, a dash not a colon) to
-      # route all Reddit requests through a rotating residential IP
-      # pool. Without it, requests go direct from the proxy VPS and
-      # Reddit CDN-blocks most datacenter IPs within hours of polling
-      # cadence. Sign up at https://webshare.io (~$3.50/month for 1GB).
-      # WEBSHARE_TOKEN: "username-password"
+      # No Reddit-routing env var. The proxy always routes through
+      # Cloudflare WARP's local SOCKS5 listener; the entrypoint
+      # refuses to start the server if that listener isn't up.
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:

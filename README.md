@@ -4,6 +4,8 @@ Tiny Reddit JSON proxy for the [Popping](https://example.com/popping) dashboard.
 
 Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll on a schedule. This proxy sits in front of Reddit on your VPS so all the dashboard's per-subreddit fetches and cross-reference searches leave one IP, with one rate limiter, instead of being scattered across wherever Popping happens to be running.
 
+**WARP inside the container.** Every Reddit request is routed through [Cloudflare WARP](https://1.1.1.1/) (the same service that powers the 1.1.1.1 DNS resolver). WARP gives the request a Cloudflare egress IP, which Reddit's CDN serves as regular residential traffic. No account, no token, no env var — the container ships with `warp-svc` baked in and the entrypoint brings it up on boot. See **How WARP works here** below.
+
 **Optional with newer Popping.** As of `popping@6869d74` the backend can scrape Reddit's `.json` endpoints directly with a polite per-process token bucket. The proxy is still the recommended path for any deployment on a residential / datacenter IP that Reddit's anti-abuse flags, but a small personal instance on a home IP that hasn't been throttled yet will work fine without it. Run `python /app/scripts/reddit_reachability.py` inside `popping-backend-1` to probe whether direct mode will work from your IP.
 
 ## Endpoints
@@ -20,7 +22,7 @@ The `/r/...` endpoint returns a flat JSON list of post objects (Reddit's `data.c
 
 Reddit throttles unauthenticated requests to `www.reddit.com` aggressively when they come from datacenter / VPS IPs and arrive on a polling cadence. The original Popping Reddit integration assumed a third-party "Hydra" gateway would handle that, but the only popular Hydra server ([dmilin1/hydra-server](https://github.com/dmilin1/hydra-server)) is a mobile-app backend, not a Reddit scraper. This proxy is the missing piece: ~150 lines of Bun that does the one job Popping needs.
 
-The proxy is still necessary for any production deploy — even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours. Pair it with a [Webshare](https://webshare.io) residential token (set `WEBSHARE_TOKEN` in the container env) and Reddit sees a rotating residential IP per request. See the **Webshare setup** section below.
+Even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours — Reddit's edge starts serving a ~190KB `text/html` block page instead of the `.json` API response. The proxy routes every request through Cloudflare WARP, so the egress IP is one of Cloudflare's (which Reddit's CDN does not blocklist) instead of the VPS's. See **How WARP works here** below.
 
 ## Run it
 
@@ -29,12 +31,13 @@ The proxy is still necessary for any production deploy — even with a real `Use
 ```sh
 docker run -d --name popping-proxy \
   --restart unless-stopped \
+  --cap-add=NET_ADMIN \
   -p 127.0.0.1:3001:3001 \
   -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
   ghcr.io/<owner>/popping-proxy:latest
 ```
 
-Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence.
+Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence. The `--cap-add=NET_ADMIN` is required for WARP to bring up its tun device inside the container; the entrypoint will fail loudly without it.
 
 The image is rebuilt automatically on every push to `main` and on every `v*` tag. Pin to a specific version with `:0.1.0` or `:sha-<short>` for reproducible deploys.
 
@@ -90,7 +93,11 @@ curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
 | `RATE_SUSTAINED` | `2` | Tokens added per second to the bucket. |
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
-| `WEBSHARE_TOKEN` | _(unset)_ | Webshare residential proxy token, format `USERNAME-PASSWORD` (a dash, not a colon). When set, every Reddit request is routed through Webshare's rotating residential IP pool. **Required for any production deploy on a datacenter / VPS IP** — Reddit CDN-level blocks most datacenter ranges within hours of polling cadence, regardless of UA or cadence. Sign up at [webshare.io](https://webshare.io) (~$3.50/month for 1GB, plenty for Popping's polling cadence). |
+
+The proxy also requires no Reddit-routing env var: the container ships
+with Cloudflare WARP baked in, and the entrypoint refuses to start
+the proxy if the WARP SOCKS5 listener isn't up. See **How WARP works
+here** below.
 
 ### User-Agent recommendations
 
@@ -106,47 +113,66 @@ popping-proxy/1.0 (+https://reddit.yourdomain.com; contact: you@yourdomain.com)
 
 Don't use: `python-requests`, `curl/7.x`, `httpx/0.x`, generic `<app>/<version>` with no URL, or a UA with a `noreply@` email — all of these either get 429'd fast or flagged for stricter review.
 
-### Webshare setup (recommended for production)
+### How WARP works here
 
-Reddit CDN-level blocks most datacenter / VPS IP ranges. The 403s come
-back as a ~190KB `text/html` block page in ~100ms — that's the CDN
-edge refusing the connection, not Reddit's anti-abuse pattern matching.
-No amount of User-Agent tuning or rate limiting will fix it: the IP is
-rejected before the request reaches Reddit's actual stack. A fresh
-VPS IP works for a few requests, then gets added to the blocklist.
+[Cloudflare WARP](https://1.1.1.1/) is the same service that powers
+the 1.1.1.1 DNS resolver — it's a free, no-account VPN that routes
+your traffic through Cloudflare's network. The proxy image ships
+with `warp-svc` and `warp-cli` installed; on first boot the
+`entrypoint.sh` script:
 
-The fix is to route requests through a residential IP pool. The
-cheapest option that just works is [Webshare](https://webshare.io)
-(~$3.50/month for 1GB bandwidth, more than enough for Popping's
-polling cadence — Popping's cross-ref sweep uses ~50 requests/hour,
-each returning 1–2 KB).
+1. Starts `warp-svc` in the background (needs `CAP_NET_ADMIN` to
+   create the WireGuard tun device).
+2. Registers the client anonymously (one-time, writes
+   `/var/lib/cloudflare-warp/reg.json`).
+3. Puts WARP into **proxy mode** — this opens `127.0.0.1:40000` as
+   a SOCKS5 endpoint that Bun's `fetch` uses directly, without
+   taking over the container's network namespace.
+4. Connects and waits for the SOCKS5 socket to be listening.
+5. Drops privileges to the unprivileged `bun` user and execs the
+   server.
 
-1. Sign up at <https://webshare.io> (rotating residential proxy,
-   any plan).
-2. From the dashboard, grab a **static proxy** token. It looks like
-   `abc123xyz-mysecretpassword` — note the dash, not a colon.
-3. Set it in the proxy container's environment:
-   ```env
-   WEBSHARE_TOKEN: "abc123xyz-mysecretpassword"
-   ```
-4. Restart the container. The startup log should now read
-   `popping-proxy 1.0.0 listening on :3001 (routing: Webshare
-   residential pool (token set))`. If it still says `direct`, the
-   env var didn't reach the container — check `docker inspect`.
+If the SOCKS5 socket never comes up, the entrypoint fails fast with
+a clear log line and the container restarts. Most common causes:
 
-The token is sensitive (it grants proxy access to your account) but
-the cost of a leaked one is bounded by Webshare's bandwidth cap, not
-your credit card — set a hard usage alert in the Webshare dashboard
-if you want belt-and-braces.
+- **`--cap-add=NET_ADMIN` missing.** Check `docker inspect
+  <container> | grep CapAdd` — the `NET_ADMIN` line should be
+  present. Add it to the compose file's `cap_add:` list and restart.
+- **TUN device not available on the host.** Some kernel configs
+  and OpenVZ/LXC virtualization backends don't expose `/dev/net/tun`.
+  Check `ls -la /dev/net/tun` on the host; the device file should
+  exist. A VPS provider that virtualizes on OpenVZ typically can't
+  run WARP — switch to a KVM-backed VPS (Hetzner, Racknerd KVM,
+  Vultr, DigitalOcean, etc.).
+- **WARP registration endpoint blocked by the host's egress
+  firewall.** Rare; WARP needs to talk to `https://api.cloudflareclient.com`
+  on first boot to register. If your VPS blocks outbound HTTPS to
+  that host, registration will time out.
+
+The proxy's startup log should read:
+
+```
+[entrypoint] warp-svc: starting
+[entrypoint] warp-cli: registered
+[entrypoint] warp-cli: connected
+[entrypoint] warp-cli: socks5 ready on 127.0.0.1:40000
+[entrypoint] exec: dropping to user bun, starting server.ts
+popping-proxy 1.0.0 listening on :3001 (routing: WARP socks5 -> 127.0.0.1:40000)
+```
 
 ## Building the image locally
 
 ```sh
 docker build -t popping-proxy:dev .
-docker run --rm -p 127.0.0.1:3001:3001 popping-proxy:dev
+docker run --rm --cap-add=NET_ADMIN -p 127.0.0.1:3001:3001 popping-proxy:dev
 ```
 
-The Dockerfile is a small `oven/bun:1.1-alpine` base that copies the server file in and runs as the unprivileged `bun` user.
+The Dockerfile is a small `oven/bun:1.1-alpine` base that installs
+`cloudflare-warp`, copies the server file and the entrypoint script
+in, and runs the entrypoint as root (warp-svc needs `CAP_NET_ADMIN`).
+The entrypoint brings up WARP, then drops privileges to the
+unprivileged `bun` user before exec'ing the server. `--cap-add=NET_ADMIN`
+is required when running locally too.
 
 ## License
 
