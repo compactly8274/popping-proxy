@@ -85,31 +85,9 @@ curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
 |---|---|---|
 | `PORT` | `3001` | Inside the container. Override if 3001 is taken on the host. |
 | `USER_AGENT` | `popping-proxy/1.0 (+https://example.com/popping-proxy)` | **Always override this in production** with a real contact string. Reddit's anti-abuse 403s generic UAs within hours of polling cadence. The pattern that gets the most headroom is `popping-proxy/1.0 (+<project-url>; contact: <real-email>)`. |
-| `REDDIT_CLIENT_ID` | _(empty)_ | Reddit "script" app client_id. When both this and `REDDIT_CLIENT_SECRET` are set, the proxy authenticates with a `client_credentials` bearer token. Strongly recommended for any deployment on a datacenter / VPS IP — the public JSON endpoints are 403'd within minutes of polling cadence from throttled ranges. See "OAuth setup" below. |
-| `REDDIT_CLIENT_SECRET` | _(empty)_ | Reddit "script" app client_secret. Pair with `REDDIT_CLIENT_ID`. |
 | `RATE_SUSTAINED` | `2` | Tokens added per second to the bucket. |
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
-
-### OAuth setup
-
-Datacenter / VPS IPs are 403'd by Reddit's public-JSON anti-abuse within minutes of polling cadence, regardless of User-Agent. To get reliable Reddit access from a datacenter IP, set the OAuth env vars:
-
-1. Log in to `https://www.reddit.com/prefs/apps` and click "create another app" at the bottom of the page.
-2. **name**: anything (e.g. `popping-proxy`).
-3. **type**: `script`.
-4. **redirect URI**: `http://localhost:8080` — required by the form but never used for `client_credentials` grant.
-5. Save. The 14-char string under the app name is your `client_id`; the longer string labeled "secret" is your `client_secret`.
-6. Set both as env vars in `docker-compose.yml`:
-   ```yaml
-   REDDIT_CLIENT_ID: "abc123def456"
-   REDDIT_CLIENT_SECRET: "longer-string-from-reddit"
-   ```
-7. `docker compose up -d`. The proxy fetches and caches a bearer token on first request, refreshing ~5 min before the 1-hour expiry.
-
-Under OAuth, the per-token rate limit is 60 req/min — far above the 2 req/s the proxy's token bucket allows, so the proxy's limiter is still the bottleneck. Anti-abuse throttling doesn't apply to authenticated requests.
-
-If the OAuth token fetch fails (e.g. the `client_secret` got rotated, or Reddit's auth endpoint is having a bad day), the proxy logs the error and continues without auth — the next request retries the token fetch. The proxy never goes down because of an OAuth outage; it just falls back to the unauthenticated path (which 403s on a throttled IP, same as before OAuth was set up).
 
 ### User-Agent recommendations
 

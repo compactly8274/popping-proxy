@@ -39,15 +39,6 @@
  * a client_id/secret in the proxy config and adds nothing for this
  * use case.
  *
- * UPDATE: datacenter IPs are 403'd by Reddit's anti-abuse within
- * minutes of polling cadence, even with a real-UA. The OAuth path
- * (`REDDIT_CLIENT_ID` + `REDDIT_CLIENT_SECRET` set in env) routes
- * requests through a `client_credentials` bearer token, which uses
- * Reddit's per-token rate limit (60 req/min) and bypasses the
- * public-JSON anti-abuse. Without OAuth, residential / non-throttled
- * IPs still work; with OAuth, any IP works. Set both env vars; the
- * proxy fetches and caches the token automatically.
- *
  * Rate limiting
  * -------------
  * Token bucket, 2 req/s sustained, 4 burst. Popping's cross-ref
@@ -105,24 +96,6 @@ const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
 
-// Reddit OAuth (script-app) credentials. When both are set, the proxy
-// fetches a `client_credentials` bearer token from
-// `https://www.reddit.com/api/v1/access_token` and adds it to every
-// Reddit request. Authenticated requests use Reddit's per-token rate
-// limit (60 req/min) instead of the public-JSON anti-abuse throttle
-// (which 403s datacenter IPs within minutes of polling cadence).
-//
-// To set up: log in to https://www.reddit.com/prefs/apps, create a
-// "script" app (redirect URI is required by the form but never used
-// for client_credentials; `http://localhost:8080` is the conventional
-// filler). The 14-char string under the app name is the client_id;
-// the longer string labeled "secret" is the client_secret.
-const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID ?? "";
-const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET ?? "";
-const REDDIT_OAUTH_ENABLED = Boolean(
-  REDDIT_CLIENT_ID.trim() && REDDIT_CLIENT_SECRET.trim(),
-);
-
 const VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
@@ -161,71 +134,6 @@ function takeToken(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Reddit OAuth (client_credentials) token cache.
-//
-// Reddit's script-app OAuth issues a bearer token good for `expires_in`
-// seconds (typically 3600 = 1 hour). We cache it in module state and
-// refresh 5 min before expiry, so a long-running process never makes
-// more than ~one auth call per hour. The token is shared across all
-// concurrent requests (read-only, just a string).
-//
-// The token fetch itself is HTTP Basic auth with form-encoded body:
-//   POST https://www.reddit.com/api/v1/access_token
-//   Authorization: Basic base64(client_id:client_secret)
-//   Content-Type: application/x-www-form-urlencoded
-//   Body: grant_type=client_credentials
-// Response: {"access_token": "...", "token_type": "bearer", "expires_in": 3600, "scope": "*"}
-// ---------------------------------------------------------------------------
-
-let _oauthToken: string | null = null;
-let _oauthTokenExpiresAt = 0; // unix ms; refresh 5 min before expiry
-
-async function getOauthToken(): Promise<string> {
-  const now = Date.now();
-  if (_oauthToken && now < _oauthTokenExpiresAt) {
-    return _oauthToken;
-  }
-  const basic = Buffer.from(
-    `${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`,
-  ).toString("base64");
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
-  try {
-    const resp = await fetch("https://www.reddit.com/api/v1/access_token", {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${basic}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": USER_AGENT,
-      },
-      body: "grant_type=client_credentials",
-      signal: ctrl.signal,
-    });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      throw new Error(
-        `oauth token fetch returned ${resp.status}: ${text.slice(0, 200)}`,
-      );
-    }
-    const json = (await resp.json()) as {
-      access_token?: string;
-      expires_in?: number;
-    };
-    if (!json.access_token || typeof json.expires_in !== "number") {
-      throw new Error(
-        `oauth token response missing access_token/expires_in: ${JSON.stringify(json).slice(0, 200)}`,
-      );
-    }
-    _oauthToken = json.access_token;
-    // Refresh 5 min before expiry; never let the cached token go stale.
-    _oauthTokenExpiresAt = now + (json.expires_in - 300) * 1000;
-    return _oauthToken;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Reddit I/O
 // ---------------------------------------------------------------------------
 
@@ -244,28 +152,8 @@ async function fetchReddit(path: string): Promise<Response> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
   try {
-    const headers: Record<string, string> = {
-      "User-Agent": USER_AGENT,
-      Accept: "application/json",
-    };
-    // Authenticated path: client_credentials bearer token. Without
-    // OAuth, datacenter IPs get 403'd by anti-abuse within minutes
-    // of polling cadence. With OAuth, the per-token rate limit
-    // (60 req/min) applies and the anti-abuse throttles don't.
-    if (REDDIT_OAUTH_ENABLED) {
-      try {
-        const token = await getOauthToken();
-        headers["Authorization"] = `Bearer ${token}`;
-      } catch (e) {
-        // Fail open: log and continue without auth. The request will
-        // likely 403, but we don't want an OAuth outage (expired
-        // client_secret, Reddit downtime on the auth endpoint) to
-        // take the whole proxy down. The next request retries.
-        console.error(`popping-proxy: oauth token fetch failed: ${e}`);
-      }
-    }
     return await fetch(url, {
-      headers,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
       signal: ctrl.signal,
       // No follow-redirects option needed; Reddit's `.json` endpoints
       // don't redirect, and the few 30x they emit (rare) point at the
