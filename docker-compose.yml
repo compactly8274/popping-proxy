@@ -8,7 +8,12 @@ services:
       # service, which already owns 3000. Override with PORT=…
       # if 3001 is taken on the VPS.
       PORT: "3001"
-      USER_AGENT: "popping-proxy/1.0 (+https://github.com/compactly8274/popping; contact: you@example.com)"
+      # Override USER_AGENT in production. Reddit's anti-abuse
+      # wants a real contact string in the UA — a generic
+      # project URL plus your email keeps the proxy out of
+      # the 403 zone. Example:
+      #   USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy; contact: you@example.com)"
+      USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy)"
       # 2 req/s sustained, 4 burst. Popping's cross-ref sweep fires
       # ~50 requests in a tight loop; the limiter spreads them out
       # so Reddit sees a polite cadence.
@@ -16,8 +21,8 @@ services:
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
     # Bind to localhost only — terminate TLS at your existing
-    # reverse proxy (Caddy / Traefik / nginx) and forward
-    # hydra.pancakefarts.site -> 127.0.0.1:3001.
+    # reverse proxy (Caddy / Traefik / nginx) and forward your
+    # chosen proxy hostname to 127.0.0.1:3001.
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:

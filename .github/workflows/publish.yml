@@ -1,0 +1,105 @@
+name: publish
+
+# Builds and publishes the popping-proxy container image to GitHub
+# Container Registry (ghcr.io) on every push of a `v*` tag and on
+# every push to `main` (as the rolling `latest` tag).
+#
+# Image tags produced
+# -------------------
+# On tag push v1.2.3:
+#   ghcr.io/<owner>/popping-proxy:1.2.3
+#   ghcr.io/<owner>/popping-proxy:1.2
+#   ghcr.io/<owner>/popping-proxy:1
+#   ghcr.io/<owner>/popping-proxy:latest
+# On push to main (no tag):
+#   ghcr.io/<owner>/popping-proxy:latest
+#   ghcr.io/<owner>/popping-proxy:sha-<short-sha>
+#
+# Multi-arch
+# ----------
+# Builds for both linux/amd64 (servers, most VPSes, TrueNAS SCALE)
+# and linux/arm64 (Raspberry Pi, Apple Silicon, Oracle Ampere).
+# QEMU is set up by docker/setup-qemu-action; buildx by
+# docker/setup-buildx-action. The buildx cache is persisted in
+# the GitHub Actions cache so subsequent builds reuse the
+# oven/bun base image layer and run in ~30s after the first.
+#
+# Required secrets / permissions
+# ------------------------------
+# The workflow uses the built-in GITHUB_TOKEN (no PAT needed).
+# The `packages: write` permission is granted to the workflow
+# under `permissions:` so the GITHUB_TOKEN can push to ghcr.io.
+# Forks and PRs from forks do not get this permission, so
+# builds there are no-ops (no image published).
+#
+# The image is published as a public package — anyone with the
+# URL can pull it. If you want a private image, change
+# `packages: read` in the visibility note below and add a
+# `ghcr.io/<owner>/popping-proxy:README` "private" toggle on
+# the package settings page after the first push.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # GITHUB_TOKEN is auto-injected by GitHub Actions and
+        # has packages: write because of the `permissions:`
+        # block above. No secret configuration needed.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/popping-proxy
+          tags: |
+            # Rolling "latest" on every push to main.
+            type=raw,value=latest,enable={{is_default_branch}}
+            # On tag push v1.2.3, emit the semver triplet.
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # Short SHA on every build, for "I want the build
+            # from commit abc1234" lookups.
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=popping-proxy
+            org.opencontainers.image.description=Tiny Reddit JSON proxy for the Popping dashboard
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false

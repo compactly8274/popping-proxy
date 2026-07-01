@@ -74,7 +74,7 @@
 const PORT = Number(process.env.PORT ?? 3001);
 const USER_AGENT =
   process.env.USER_AGENT ??
-  "popping-proxy/1.0 (+https://github.com/compactly8274/popping)";
+  "popping-proxy/1.0 (+https://example.com/popping-proxy)";
 const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
