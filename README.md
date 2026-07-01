@@ -28,21 +28,26 @@ Reddit throttles unauthenticated requests to `www.reddit.com` aggressively when 
 docker run -d --name popping-proxy \
   --restart unless-stopped \
   -p 127.0.0.1:3001:3001 \
-  -e USER_AGENT="popping-proxy/1.0 (+https://example.com/popping-proxy; contact: you@example.com)" \
+  -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
   ghcr.io/<owner>/popping-proxy:latest
 ```
 
-Replace `<owner>` with the GitHub org / user that owns the image (the GitHub user or org that hosts this repo). The `USER_AGENT` is the only required env var — set it to a real contact email so Reddit's anti-abuse leaves the request alone.
+Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence.
 
-### Build from source
+The image is rebuilt automatically on every push to `main` and on every `v*` tag. Pin to a specific version with `:0.1.0` or `:sha-<short>` for reproducible deploys.
+
+### docker-compose
+
+A `docker-compose.yml` is included. It pulls the pre-built image by default; uncomment the `build: .` line if you want to compile from source.
 
 ```sh
 git clone https://github.com/<owner>/popping-proxy.git
 cd popping-proxy
+# Edit docker-compose.yml: replace <owner> in the image: line, set USER_AGENT
 docker compose up -d
 ```
 
-The container listens on `127.0.0.1:3001`. Put a Caddy vhost in front. **Use a separate subdomain from any other service on the same host** — the iPhone-app Hydra keeps owning `hydra.example.com`, and the proxy takes something else like `reddit.example.com`:
+The container listens on `127.0.0.1:3001`. Put a Caddy vhost in front. **Use a separate subdomain from any other service on the same host** — for example, if your iPhone-app Hydra occupies `hydra.example.com`, give the proxy its own like `reddit.example.com`:
 
 ```caddyfile
 reddit.example.com {
@@ -76,10 +81,24 @@ curl -s "https://reddit.example.com/r/python/hot?limit=1" | head -c 500
 | Env var | Default | Notes |
 |---|---|---|
 | `PORT` | `3001` | Inside the container. Override if 3001 is taken on the host. |
-| `USER_AGENT` | `popping-proxy/1.0 (+https://example.com/popping-proxy)` | Reddit's anti-abuse wants a contact string. **Override this in production** with a real email — see the run-it section. |
+| `USER_AGENT` | `popping-proxy/1.0 (+https://example.com/popping-proxy)` | **Always override this in production** with a real contact string. Reddit's anti-abuse 403s generic UAs within hours of polling cadence. The pattern that gets the most headroom is `popping-proxy/1.0 (+<project-url>; contact: <real-email>)`. |
 | `RATE_SUSTAINED` | `2` | Tokens added per second to the bucket. |
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
+
+### User-Agent recommendations
+
+Reddit's anti-abuse throttles aggressively on UAs that look like a script. Use a real, descriptive one. Working examples:
+
+```
+# Best — real project URL + real contact email
+popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)
+
+# Acceptable — domain you control that points at a page describing the proxy
+popping-proxy/1.0 (+https://reddit.yourdomain.com; contact: you@yourdomain.com)
+```
+
+Don't use: `python-requests`, `curl/7.x`, `httpx/0.x`, generic `<app>/<version>` with no URL, or a UA with a `noreply@` email — all of these either get 429'd fast or flagged for stricter review.
 
 ## Building the image locally
 

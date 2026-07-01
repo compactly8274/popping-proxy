@@ -72,9 +72,23 @@
 // on the VPS. Bind to localhost via docker-compose so the only
 // public entry point is the reverse proxy in front of it.
 const PORT = Number(process.env.PORT ?? 3001);
-const USER_AGENT =
-  process.env.USER_AGENT ??
+// Default User-Agent. Operators should override this in production
+// with a real contact email — Reddit's anti-abuse 403s generic
+// UAs within hours of polling cadence. The recommended pattern is
+// `popping-proxy/<version> (+<project-url>; contact: <real-email>)`.
+// See the README's "User-Agent recommendations" section.
+//
+// The fallback below uses example.com (RFC 2606 reserved — it
+// always resolves, but to a placeholder page, so it's clearly
+// not a real project's domain). A fresh install that forgot to
+// set USER_AGENT will at least present a UA that looks like a
+// real project (URL + version), which buys more headroom than
+// a library-default or empty UA. The operator still needs to
+// set USER_AGENT to get the full grace period — see the README.
+const DEFAULT_USER_AGENT =
   "popping-proxy/1.0 (+https://example.com/popping-proxy)";
+
+const USER_AGENT = process.env.USER_AGENT ?? DEFAULT_USER_AGENT;
 const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
 const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);

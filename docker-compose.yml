@@ -1,18 +1,39 @@
+# docker-compose.yml — runs popping-proxy using the pre-built image
+# from GitHub Container Registry. To pin to a specific release,
+# change `:latest` to a version tag (e.g. `:0.1.0`) or a SHA tag
+# (e.g. `:sha-83fc640`).
+#
+# To build from source instead of pulling the pre-built image,
+# comment out the `image:` line and uncomment `build: .`. You'll
+# need the Dockerfile (already in this repo) and a working Docker
+# build context.
+#
+# Required env / setup
+# --------------------
+# 1. Replace `<owner>` in the `image:` line with the GitHub user
+#    or org that hosts this repo (the GHCR image lives at
+#    ghcr.io/<owner>/popping-proxy).
+# 2. Set USER_AGENT below to a real contact string. Reddit's
+#    anti-abuse will 403 you within hours of polling cadence if
+#    the UA is generic. The pattern Reddit's docs recommend is
+#    `<app>/<version> (+<project-url>; contact: <real-email>)`.
+# 3. Bind to localhost only — terminate TLS at your existing
+#    reverse proxy (Caddy / Traefik / nginx) and forward your
+#    chosen proxy hostname to 127.0.0.1:3001.
+
 services:
   popping-proxy:
-    build: .
+    image: ghcr.io/<owner>/popping-proxy:latest
+    # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
+    pull_policy: always
     environment:
-      # Override these in a .env file or your compose override.
-      # 3001 — chosen to sit one above the user's real Hydra
-      # service, which already owns 3000. Override with PORT=…
-      # if 3001 is taken on the VPS.
       PORT: "3001"
-      # Override USER_AGENT in production. Reddit's anti-abuse
-      # wants a real contact string in the UA — a generic
-      # project URL plus your email keeps the proxy out of
-      # the 403 zone. Example:
-      #   USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy; contact: you@example.com)"
+      # Reddit wants a real contact in the UA. The default below is
+      # generic (no contact email) — a fresh deploy will work for
+      # the first few requests but get 403'd within hours. Replace
+      # with the recommended pattern before going live:
+      #   USER_AGENT: "popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)"
       USER_AGENT: "popping-proxy/1.0 (+https://example.com/popping-proxy)"
       # 2 req/s sustained, 4 burst. Popping's cross-ref sweep fires
       # ~50 requests in a tight loop; the limiter spreads them out
@@ -20,9 +41,6 @@ services:
       RATE_SUSTAINED: "2"
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
-    # Bind to localhost only — terminate TLS at your existing
-    # reverse proxy (Caddy / Traefik / nginx) and forward your
-    # chosen proxy hostname to 127.0.0.1:3001.
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:
