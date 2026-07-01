@@ -160,7 +160,32 @@ if ! timeout 60 warp-cli --accept-tos connect; then
 fi
 log "warp-cli: connected"
 
-# --- 7. Wait for the SOCKS5 socket ------------------------------------------
+# --- 7. Diagnose what the daemon is actually doing -------------------------
+# In the 2026.6.x client the SOCKS5 listener is no longer reliably on
+# 127.0.0.1:40000 in proxy mode — the tunnel is MASQUE-based now and
+# the listener may be on a different port, or the proxy mode may route
+# differently. Dump the daemon's view of the world so we can see what
+# the next entrypoint should be polling for. This block is intentionally
+# noisy; it always runs after a successful connect, before the SOCKS5
+# wait fails. Remove once the right port is identified.
+log "diag: --- warp-cli status ---"
+warp-cli --accept-tos status 2>&1 | sed 's/^/[entrypoint] diag: /'
+log "diag: --- warp-cli settings ---"
+warp-cli --accept-tos settings 2>&1 | sed 's/^/[entrypoint] diag: /'
+log "diag: --- listening sockets ---"
+ss -tlnp 2>&1 | sed 's/^/[entrypoint] diag: /'
+log "diag: --- port probes ---"
+for p in 40000 40001 1080 9050 8080; do
+    if nc -z 127.0.0.1 $p 2>/dev/null; then
+        log "diag: port $p -> LISTENING"
+    else
+        log "diag: port $p -> not listening"
+    fi
+done
+log "diag: --- last 5 warp-svc log lines ---"
+tail -5 /tmp/warp-svc.log 2>/dev/null | sed 's/^/[entrypoint] diag: /' || true
+
+# --- 8. Wait for the SOCKS5 socket ------------------------------------------
 # The SOCKS5 listener is on 127.0.0.1:40000 once the tunnel is up.
 # `nc -z` (from netcat-openbsd, the default on debian-slim) does a
 # zero-I/O connect probe and exits 0 on success. Poll until it
