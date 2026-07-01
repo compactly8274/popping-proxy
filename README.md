@@ -4,7 +4,7 @@ Tiny Reddit JSON proxy for the [Popping](https://example.com/popping) dashboard.
 
 Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll on a schedule. This proxy sits in front of Reddit on your VPS so all the dashboard's per-subreddit fetches and cross-reference searches leave one IP, with one rate limiter, instead of being scattered across wherever Popping happens to be running.
 
-**WARP inside the container.** Every Reddit request is routed through [Cloudflare WARP](https://1.1.1.1/) (the same service that powers the 1.1.1.1 DNS resolver). WARP gives the request a Cloudflare egress IP, which Reddit's CDN serves as regular residential traffic. No account, no token, no env var — the container ships with `warp-svc` baked in and the entrypoint brings it up on boot. See **How WARP works here** below.
+**Routed through Cloudflare WARP.** Every Reddit request leaves the VPS through a Cloudflare egress IP, which Reddit's CDN serves as regular residential traffic (Cloudflare is also a Reddit CDN customer, so the IP class is implicitly trusted). WARP itself runs on the host with a split-tunnel iptables rule that only affects this container's egress — Caddy, other containers, and the host's own traffic stay direct. See **Host setup** below.
 
 **Optional with newer Popping.** As of `popping@6869d74` the backend can scrape Reddit's `.json` endpoints directly with a polite per-process token bucket. The proxy is still the recommended path for any deployment on a residential / datacenter IP that Reddit's anti-abuse flags, but a small personal instance on a home IP that hasn't been throttled yet will work fine without it. Run `python /app/scripts/reddit_reachability.py` inside `popping-backend-1` to probe whether direct mode will work from your IP.
 
@@ -22,29 +22,81 @@ The `/r/...` endpoint returns a flat JSON list of post objects (Reddit's `data.c
 
 Reddit throttles unauthenticated requests to `www.reddit.com` aggressively when they come from datacenter / VPS IPs and arrive on a polling cadence. The original Popping Reddit integration assumed a third-party "Hydra" gateway would handle that, but the only popular Hydra server ([dmilin1/hydra-server](https://github.com/dmilin1/hydra-server)) is a mobile-app backend, not a Reddit scraper. This proxy is the missing piece: ~150 lines of Bun that does the one job Popping needs.
 
-Even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours — Reddit's edge starts serving a ~190KB `text/html` block page instead of the `.json` API response. The proxy routes every request through Cloudflare WARP, so the egress IP is one of Cloudflare's (which Reddit's CDN does not blocklist) instead of the VPS's. See **How WARP works here** below.
+Even with a real `User-Agent`, a datacenter IP gets CDN-blocked within hours — Reddit's edge starts serving a ~190KB `text/html` block page instead of the `.json` API response. The proxy routes every request through Cloudflare WARP, so the egress IP is one of Cloudflare's (which Reddit's CDN does not blocklist) instead of the VPS's. See **Host setup** below.
 
 ## Run it
 
-### Pre-built image (recommended)
+### 1. Host setup (one-time per VPS)
+
+WARP runs on the host, not in the container. Install it and set up a split-tunnel rule that only routes the proxy container's egress through the WARP tun. The repo ships a script for this — copy `host-setup.sh` to the VPS and run it as root:
+
+```sh
+# On the VPS
+scp host-setup.sh root@<vps>:/root/host-setup.sh
+ssh root@<vps> bash /root/host-setup.sh
+```
+
+The script installs the `cloudflare-warp` package from Cloudflare's apt repo, starts `dbus` and `warp-svc`, runs an anonymous registration (`/var/lib/cloudflare-warp/reg.json`), puts WARP into TUN mode, connects, verifies the `CloudflareWARP` tun device, then adds an `ip rule` + table 100 that sends only the docker bridge subnet through the WARP tun. It's idempotent and safe to re-run.
+
+If you'd rather do it by hand, the same commands the script runs are:
+
+```sh
+# Debian / Ubuntu. Adjust for other distros.
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --dearmor \
+    -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+apt-get update && apt-get install -y cloudflare-warp
+
+# dbus: warp-svc's power_notifier wants a system bus.
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+
+# Start the daemon and register (anonymous, one-time).
+systemctl enable --now warp-svc
+sleep 3
+if [ ! -f /var/lib/cloudflare-warp/reg.json ]; then
+    warp-cli --accept-tos registration new
+fi
+warp-cli --accept-tos mode warp      # TUN mode: brings up the CloudflareWARP interface
+warp-cli --accept-tos connect
+sleep 5
+ip link show CloudflareWARP         # should show a L3 device with an address
+
+# Split-tunnel: only the docker bridge subnet's traffic goes via WARP.
+# Everything else on the host (Caddy, other containers, the host's
+# own traffic) stays direct.
+DOCKER_BRIDGE=$(ip route | awk '/docker/ && /scope link/ && /172/ {print $1; exit}')
+echo "Docker bridge subnet: $DOCKER_BRIDGE"
+ip route add default dev CloudflareWARP table 100 2>/dev/null || true
+ip rule add from $DOCKER_BRIDGE lookup 100 priority 100 2>/dev/null || true
+```
+
+The `ip rule` is the key bit — it says "any packet with a source IP inside the docker bridge subnet consult routing table 100, which sends everything to the WARP tun". Other containers on the same host (and the host itself) are unaffected.
+
+Verify the host routing is working before starting the container:
+
+```sh
+curl --interface eth0 https://www.cloudflare.com/cdn-cgi/trace | grep warp
+# warp=on
+```
+
+To restore the split-tunnel rule on reboot, drop the snippet the script prints at the end into `/etc/rc.local` (or your distro's equivalent startup hook).
+
+### 2. Start the container
 
 ```sh
 docker run -d --name popping-proxy \
   --restart unless-stopped \
-  --cap-add=NET_ADMIN --cap-add=MKNOD \
-  --device-cgroup-rule='c 10:200 rwm' \
-  --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
   -p 127.0.0.1:3001:3001 \
   -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
   ghcr.io/<owner>/popping-proxy:latest
 ```
 
-Replace `<owner>` with the GitHub user or org that hosts this repo, and `you@yourdomain.com` with a real email you monitor. The `USER_AGENT` is the only required env var — without a real contact, Reddit's anti-abuse will start 403ing the proxy within hours of polling cadence. The `--cap-add`, `--device-cgroup-rule`, and `--sysctl` flags are required for WARP to bring up its tun device and route packets correctly; the entrypoint will fail loudly without them.
+No `--cap-add`, no `--device-cgroup-rule`, no `--sysctl` — the container is a plain Bun app. WARP and all its kernel requirements live on the host.
 
-The image is rebuilt automatically on every push to `main` and on every `v*` tag. Pin to a specific version with `:0.1.0` or `:sha-<short>` for reproducible deploys.
-
-### docker-compose
+### 3. docker-compose (recommended)
 
 A `docker-compose.yml` is included. It pulls the pre-built image by default; uncomment the `build: .` line if you want to compile from source.
 
@@ -87,6 +139,14 @@ curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
 # Same response as above; the .json suffix is optional.
 ```
 
+To confirm the egress really is on Cloudflare (not the VPS's own IP), check from inside the container:
+
+```sh
+docker exec popping-proxy-popping-proxy-1 \
+  curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp|colo'
+# warp=on,colo=<closest cloudflare dc>
+```
+
 ## Config
 
 | Env var | Default | Notes |
@@ -97,10 +157,7 @@ curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
 | `RATE_BURST` | `4` | Bucket cap. |
 | `UPSTREAM_TIMEOUT_S` | `10` | Per-request timeout for the call to Reddit. |
 
-The proxy also requires no Reddit-routing env var: the container ships
-with Cloudflare WARP baked in, and the entrypoint refuses to start
-the proxy if the WARP SOCKS5 listener isn't up. See **How WARP works
-here** below.
+The proxy needs no Reddit-routing env var. WARP runs on the host; the proxy's egress is routed through the host's WARP tun by a split-tunnel iptables rule that matches the docker bridge subnet. See **Host setup** above.
 
 ### User-Agent recommendations
 
@@ -116,94 +173,76 @@ popping-proxy/1.0 (+https://reddit.yourdomain.com; contact: you@yourdomain.com)
 
 Don't use: `python-requests`, `curl/7.x`, `httpx/0.x`, generic `<app>/<version>` with no URL, or a UA with a `noreply@` email — all of these either get 429'd fast or flagged for stricter review.
 
-### How WARP works here
+## How WARP routing works here
 
-[Cloudflare WARP](https://1.1.1.1/) is the same service that powers
-the 1.1.1.1 DNS resolver — it's a free, no-account VPN that routes
-your traffic through Cloudflare's network. The proxy image ships
-with `warp-svc` and `warp-cli` installed; on first boot the
-`entrypoint.sh` script:
-
-1. Creates `/dev/net/tun` if the host hasn't injected it
-   (character device, major 10 minor 200).
-2. Starts an in-container dbus system bus (warp-svc's
-   `power_notifier` subsystem retries dbus every 3s without one,
-   filling the log).
-3. Starts `warp-svc` in the background (needs `CAP_NET_ADMIN` to
-   create the WireGuard tun device; `--accept-tos` to skip the
-   TOS prompt on first run).
-4. Waits for the daemon to respond to `warp-cli status` queries.
-5. Registers the client anonymously (one-time, writes
-   `/var/lib/cloudflare-warp/reg.json`).
-6. Puts WARP into **proxy mode** — this opens `127.0.0.1:40000` as
-   a SOCKS5 endpoint that Bun's `fetch` uses directly, without
-   taking over the container's network namespace.
-7. Connects and waits for the SOCKS5 socket to be listening.
-8. Drops privileges to the unprivileged `bun` user and execs the
-   server.
-
-If the SOCKS5 socket never comes up, the entrypoint fails fast with
-a clear log line and the container restarts. Most common causes:
-
-- **`--cap-add=NET_ADMIN` or `--cap-add=MKNOD` missing.** Check
-  `docker inspect <container> | grep CapAdd` — both `NET_ADMIN` and
-  `MKNOD` should be present. Add to the compose file's `cap_add:`
-  list and restart.
-- **`device_cgroup_rules: ['c 10:200 rwm']` missing.** Even with
-  `CAP_NET_ADMIN` and `/dev/net/tun` present, the kernel blocks
-  opens on the device unless the cgroup is granted r/w/m. The
-  compose file already has this; check it didn't get dropped in
-  a custom override.
-- **`sysctls` not set on the container.** `net.ipv4.conf.all.src_valid_mark=1`
-  and `net.ipv6.conf.all.disable_ipv6=0` are required for WireGuard's
-  packet routing. The compose file has them; check `docker inspect
-  <container> | grep -i sysctl` to confirm they made it through.
-- **TUN device not available on the host.** Some kernel configs
-  and OpenVZ/LXC virtualization backends don't expose `/dev/net/tun`
-  at all. Check `ls -la /dev/net/tun` on the host; the device file
-  should exist. A VPS provider that virtualizes on OpenVZ typically
-  can't run WARP — switch to a KVM-backed VPS (Hetzner, Racknerd
-  KVM, Vultr, DigitalOcean, etc.).
-- **WARP registration endpoint blocked by the host's egress
-  firewall.** Rare; WARP needs to talk to `https://api.cloudflareclient.com`
-  on first boot to register. If your VPS blocks outbound HTTPS to
-  that host, registration will time out.
-
-The proxy's startup log should read:
+[Cloudflare WARP](https://1.1.1.1/) is the same service that powers the 1.1.1.1 DNS resolver — it's a free, no-account VPN that routes your traffic through Cloudflare's network. WARP itself runs on the host (not in the proxy container), and a split-tunnel rule on the host makes the proxy container's egress the only traffic that goes through it.
 
 ```
-[entrypoint] warp-svc: starting
-[entrypoint] warp-cli: registered
-[entrypoint] warp-cli: connected
-[entrypoint] warp-cli: socks5 ready on 127.0.0.1:40000
-[entrypoint] exec: dropping to user bun, starting server.ts
-popping-proxy 1.0.0 listening on :3001 (routing: WARP socks5 -> 127.0.0.1:40000)
++---------------------+        +-------------------+        +------------------+
+| popping-proxy       |        | VPS host          |        | Internet         |
+| (Bun, USER bun)     |        |                   |        |                  |
+|                     |        |  +-------------+  |        |                  |
+|  fetch() ---+       |        |  | iptables    |  |        |                  |
+|             |       |        |  | mangle:     |  |        |                  |
+|             v       |  --->  |  |  match src  |  |  --->  |  Cloudflare      |
+|           eth0      |        |  |  = docker   |  |        |  edge (MASQUE)   |
+|             |       |        |  |  bridge --+ |  |        |       |          |
+|             |       |        |  +-----------|--+  |        |       v          |
+|             |       |        |              |     |        |  Reddit CDN      |
+|             |       |        |              v     |        |  (sees CF IP)    |
+|             |       |        |  ip rule:   table 100    |        |                  |
+|             |       |        |  from $DOCKER_BRIDGE    |        |                  |
+|             |       |        |  lookup 100             |        |                  |
+|             |       |        |              |         |        |                  |
+|             |       |        |              v         |        |                  |
+|             |       |        |  ip route:  default    |        |                  |
+|             |       |        |  dev CloudflareWARP    |        |                  |
+|             |       |        |  table 100             |        |                  |
+|             |       |        |              |         |        |                  |
+|             |       |        |              v         |        |                  |
+|             |       |        |  CloudflareWARP (tun)  |        |                  |
+|             |       |        |       |                |        |                  |
++---------------------+        +-------------------+        +------------------+
+                                Everything else on the host
+                                (Caddy, other containers, host's
+                                own traffic) is unaffected — only
+                                packets whose source IP is in the
+                                docker bridge subnet match the
+                                iptables mangle rule.
 ```
+
+Why host-level WARP and not in-container WARP: the 2026.6.x `warp-svc` daemon is MASQUE-only and does not bring up a userspace SOCKS5 listener in proxy mode (verified: `ss -tlnp` after `warp-cli connect` shows no listener on 40000/40001/1080/etc), and the tun it creates in `mode warp` is in the host's network namespace, not the container's. The split-tunnel pattern above puts the tun where the container's packets actually pass through (the docker bridge / host routing stack), which is the only place the policy can be expressed.
+
+## Troubleshooting
+
+**Still seeing 403 from Reddit.** Easiest check: run the curl from inside the container and confirm the egress IP is Cloudflare's, not your VPS's:
+
+```sh
+docker exec popping-proxy-popping-proxy-1 \
+  curl -s https://www.cloudflare.com/cdn-cgi/trace | grep warp
+# warp=on
+```
+
+If `warp=off`, the host's split-tunnel rule isn't matching the container's source IP. Most common causes:
+
+- The docker bridge subnet changed (e.g. you recreated the `docker0` bridge). Re-run the `ip rule add from $DOCKER_BRIDGE …` line with the current subnet.
+- You're running the container in `network_mode: host` (then the source IP is the host's, not the docker bridge's, and you don't need the iptables rule at all — the host's WARP route catches it).
+- `warp-cli status` shows `Disconnected`. Run `warp-cli connect` and check `systemctl status warp-svc`.
+
+**`warp-cli registration new` hangs.** The WARP registration endpoint (`api.cloudflareclient.com`) needs outbound HTTPS. If your VPS's egress firewall blocks it, registration times out. Open it temporarily or use a host with less restrictive egress rules.
+
+**`warp-svc` won't start.** Check `journalctl -u warp-svc`. Common cause on minimal VPS images: missing `dbus`. Install `dbus` and start the system bus with `dbus-daemon --system --fork` before starting the daemon.
+
+**The image is rebuilt automatically on every push to `main` and on every `v*` tag.** Pin to a specific version with `:0.1.0` or `:sha-<short>` for reproducible deploys.
 
 ## Building the image locally
 
 ```sh
 docker build -t popping-proxy:dev .
-docker run --rm \
-  --cap-add=NET_ADMIN --cap-add=MKNOD \
-  --device-cgroup-rule='c 10:200 rwm' \
-  --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
-  -p 127.0.0.1:3001:3001 popping-proxy:dev
+docker run --rm -p 127.0.0.1:3001:3001 popping-proxy:dev
 ```
 
-The Dockerfile is a small `oven/bun:1.1-debian` base that installs
-`cloudflare-warp` from Cloudflare's official apt repo, copies the
-server file and the entrypoint script in, and runs the entrypoint
-as root (warp-svc needs `CAP_NET_ADMIN`). The entrypoint brings
-up WARP, then drops privileges to the unprivileged `bun` user
-before exec'ing the server. The `cap_add`, `device_cgroup_rules`,
-and `sysctls` lines in docker-compose (and the equivalent
-`--cap-add` / `--device-cgroup-rule` / `--sysctl` flags above)
-are required — without them, WARP's tun device can't be created
-or the WireGuard handshake silently fails. We use the debian
-base, not alpine, because WARP's `warp-svc` is a closed-source
-glibc-linked binary and does not run on musl.
+The Dockerfile is a small `oven/bun:1.1-debian` base that copies the server file and the entrypoint script in, and runs the entrypoint as the unprivileged `bun` user. There's no WARP, no dbus, no TUN, no sysctls — those are host concerns now.
 
 ## License
 

@@ -20,6 +20,12 @@
 # 3. Bind to localhost only — terminate TLS at your existing
 #    reverse proxy (Caddy / Traefik / nginx) and forward your
 #    chosen proxy hostname to 127.0.0.1:3001.
+# 4. **Run the WARP host setup once on the VPS before starting the
+#    container** — see README "Host setup". The container's egress
+#    is routed through the host's WARP tun by an iptables rule that
+#    matches the docker bridge subnet, so all Reddit requests leave
+#    from a Cloudflare egress IP. Without the host setup the
+#    container starts and listens, but Reddit returns 403.
 
 services:
   popping-proxy:
@@ -27,30 +33,11 @@ services:
     # build: .   # uncomment to build from source instead of pulling
     restart: unless-stopped
     pull_policy: always
-    # Cloudflare WARP runs in the container as warp-svc. Capabilities
-    # needed:
-    #   - NET_ADMIN: manage the WireGuard tun device and routes.
-    #   - MKNOD:    create /dev/net/tun if it's not pre-injected
-    #               (the entrypoint mknods it as a fallback).
-    # device_cgroup_rules grants r/w/m access to the TUN char device
-    # (major 10, minor 200); without this the kernel blocks opens
-    # on the device even when CAP_NET_ADMIN is held.
-    # sysctls:
-    #   - net.ipv4.conf.all.src_valid_mark=1: required for
-    #     WireGuard's fwmark-based source-routing trick. Without
-    #     this, the WireGuard handshake succeeds but the response
-    #     packets get dropped because the kernel can't route them
-    #     back through the tun interface.
-    #   - net.ipv6.conf.all.disable_ipv6=0: warp-svc expects IPv6
-    #     to be available on the tun interface.
-    cap_add:
-      - NET_ADMIN
-      - MKNOD
-    device_cgroup_rules:
-      - 'c 10:200 rwm'
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv6.conf.all.disable_ipv6=0
+    # No cap_add / device_cgroup_rules / sysctls here. WARP runs on
+    # the host, not in this container; the container is a plain Bun
+    # app and runs as USER bun. Its only special requirement is the
+    # network path out, which the host's iptables mangle rule
+    # (added by the host setup) takes care of.
     environment:
       PORT: "3001"
       # Reddit wants a real contact in the UA. The default below is
@@ -65,9 +52,6 @@ services:
       RATE_SUSTAINED: "2"
       RATE_BURST: "4"
       UPSTREAM_TIMEOUT_S: "10"
-      # No Reddit-routing env var. The proxy always routes through
-      # Cloudflare WARP's local SOCKS5 listener; the entrypoint
-      # refuses to start the server if that listener isn't up.
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:
