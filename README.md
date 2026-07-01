@@ -10,7 +10,7 @@ Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll
 
 | Method | Path | Upstream |
 |---|---|---|
-| `GET` | `/r/:sub/:listing?limit=N` | `https://www.reddit.com/r/{sub}/{listing}.json?limit=N` |
+| `GET` | `/r/:sub/:listing?limit=N` or `/r/:sub/:listing.json?limit=N` | `https://www.reddit.com/r/{sub}/{listing}.json?limit=N` |
 | `GET` | `/search?url=...` | `https://www.reddit.com/search.json?q=url:{url}&limit=1&sort=relevance` |
 | `GET` | `/healthz` | (none — local) |
 
@@ -74,6 +74,9 @@ curl -s https://reddit.example.com/healthz
 
 curl -s "https://reddit.example.com/r/python/hot?limit=1" | head -c 500
 # [{"id":"t3_...","title":"...","score":...,"num_comments":...,"permalink":"/r/python/comments/...","url":"...","subreddit":"python",...}]
+
+curl -s "https://reddit.example.com/r/python/hot.json?limit=1" | head -c 500
+# Same response as above; the .json suffix is optional.
 ```
 
 ## Config

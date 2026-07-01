@@ -17,8 +17,11 @@
  *
  * Endpoints
  * ---------
- *   GET /r/:sub/:listing?limit=N          -> Reddit `data.children[]`
- *                                             unwrapped to a flat list
+ *   GET /r/:sub/:listing?limit=N      -> Reddit `data.children[]`
+ *                                          unwrapped to a flat list
+ *   GET /r/:sub/:listing.json?limit=N -> same as above; the
+ *                                          trailing ".json" is optional
+ *                                          and ignored
  *   GET /search?url=...                   -> Reddit's own
  *                                             /search.json?q=url:...
  *                                             first result as
@@ -231,12 +234,16 @@ const server = Bun.serve({
 
     // Subreddit listing.
     //   GET /r/:sub/:listing?limit=N
+    //   GET /r/:sub/:listing.json?limit=N
     // :sub is one path segment; :listing is the next. The regex
-    // rejects everything else (e.g. /r/foo/bar/baz or
-    // /r/foo/comments/abc) and returns 404 — Reddit's
-    // /r/{sub}/comments/{id} endpoint isn't a listing shape and
-    // Popping never calls it.
-    const subMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)$/.exec(url.pathname);
+    // accepts an optional trailing ".json" so both /r/python/hot
+    // and /r/python/hot.json route to the same handler — clients
+    // that hardcode the .json suffix (Reddit's own URL shape) get
+    // the same response without a 404. The regex still rejects
+    // anything else (e.g. /r/foo/bar/baz or
+    // /r/foo/comments/abc) — Reddit's /r/{sub}/comments/{id}
+    // endpoint isn't a listing shape and Popping never calls it.
+    const subMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.json)?$/.exec(url.pathname);
     if (subMatch) {
       const [, sub, listing] = subMatch;
       const limitRaw = url.searchParams.get("limit");
