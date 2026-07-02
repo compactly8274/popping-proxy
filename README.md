@@ -4,19 +4,23 @@ Tiny Reddit JSON proxy for the [Popping](https://example.com/popping) dashboard.
 
 Reddit's public `.json` endpoints are throttled hard on datacenter IPs that poll on a schedule. This proxy sits in front of Reddit on your VPS so all the dashboard's per-subreddit fetches and cross-reference searches leave one IP, with one rate limiter, instead of being scattered across wherever Popping happens to be running.
 
-**Routed through Webshare residential IPs.** Every Reddit request is sent through a [Webshare](https://webshare.io) residential proxy, so Reddit's CDN sees a rotating residential IP per request (~$3.50/month for 1GB of bandwidth, plenty for Popping's polling cadence). The proxy itself is a tiny plain Bun app — no caps, no sysctls, no WARP, no kernel-level networking. See **Webshare setup** below.
+**Routed through Webshare residential IPs (recommended).** Every Reddit request is sent through a [Webshare](https://webshare.io) residential proxy, so Reddit's CDN sees a rotating residential IP per request (~$3.50/month for 1GB of bandwidth, plenty for Popping's polling cadence). The proxy itself is a tiny plain Bun app — no caps, no sysctls, no WARP, no kernel-level networking. See **Webshare setup** below.
+
+**Or, run on a friendlier network and use `.rss` mode (no third-party service).** Reddit's `.json` endpoint does a JS challenge on every IP that isn't classified as residential — a 190 KB HTML block page that a CLI fetch can't pass. But the same edge serves Reddit's `.rss` (Atom XML) endpoint on a different code path that doesn't do the challenge, with a much smaller per-IP rate budget (~1 call per 30-60s on low-reputation IPs). If you run the proxy on a host with a residential-class IP (home ISP, friendly VPS) and call the `.rss` URL suffix, no Webshare token is needed. See **`.rss` mode (no Webshare)** below.
 
 **Optional with newer Popping.** As of `popping@6869d74` the backend can scrape Reddit's `.json` endpoints directly with a polite per-process token bucket. The proxy is still the recommended path for any deployment on a residential / datacenter IP that Reddit's anti-abuse flags, but a small personal instance on a home IP that hasn't been throttled yet will work fine without it. Run `python /app/scripts/reddit_reachability.py` inside `popping-backend-1` to probe whether direct mode will work from your IP.
 
 ## Endpoints
 
-| Method | Path | Upstream |
-|---|---|---|
-| `GET` | `/r/:sub/:listing?limit=N` or `/r/:sub/:listing.json?limit=N` | `https://www.reddit.com/r/{sub}/{listing}.json?limit=N` |
-| `GET` | `/search?url=...` | `https://www.reddit.com/search.json?q=url:{url}&limit=1&sort=relevance` |
-| `GET` | `/healthz` | (none — local) |
+| Method | Path | Upstream | Returns |
+|---|---|---|---|
+| `GET` | `/r/:sub/:listing?limit=N` | `https://www.reddit.com/r/{sub}/{listing}.json?limit=N` | Flat JSON list (Reddit's `data.children[]` unwrapped) |
+| `GET` | `/r/:sub/:listing.json?limit=N` | same as above | Same as above |
+| `GET` | `/r/:sub/:listing.rss?limit=N` | `https://www.reddit.com/r/{sub}/{listing}.rss?limit=N` | Atom XML, relayed unchanged |
+| `GET` | `/search?url=...` | `https://www.reddit.com/search.json?q=url:{url}&limit=1&sort=relevance` | List of zero or one hit, `[{permalink, num_comments}]` |
+| `GET` | `/healthz` | (none — local) | `{ok:true, version}` |
 
-The `/r/...` endpoint returns a flat JSON list of post objects (Reddit's `data.children[]` unwrapped). The `/search` endpoint returns a list of zero or one hit, shaped as `[{permalink, num_comments}]` — Popping's `reddit_client.search_thread_by_url` takes the first element.
+The JSON-mode endpoints return a flat JSON list of post objects (Reddit's `data.children[]` unwrapped). The `.rss` endpoint returns Reddit's Atom XML body unchanged, with the upstream `Content-Type` forwarded — Popping's `reddit_client._get_atom` parses this in-process. The `/search` endpoint returns a list of zero or one hit, shaped as `[{permalink, num_comments}]` — Popping's `reddit_client.search_thread_by_url` takes the first element.
 
 ## Why a proxy at all
 
@@ -33,6 +37,23 @@ The proxy is a plain Bun app — no host setup needed, no kernel networking, no 
 1. Sign up at <https://webshare.io> (rotating residential proxy, any plan).
 2. From the dashboard, grab a **static proxy** token. It looks like `abc123xyz-mysecretpassword` — note the dash, not a colon.
 3. Set it in the proxy container's environment as `WEBSHARE_TOKEN` (see step 2 below).
+
+### 1b. `.rss` mode (no Webshare)
+
+If you run the proxy on a host whose IP class Reddit's edge treats as residential (home ISP, friendly VPS), you can skip Webshare entirely and use the `.rss` URL suffix instead. This works because Reddit's `.rss` endpoint is on a different CDN code path that doesn't do the JS challenge — it serves real Atom XML to most IPs, with a much smaller per-IP rate budget.
+
+**Trade-offs vs Webshare:**
+- **No third-party service** (no Webshare account, no monthly fee)
+- **Lower per-IP rate budget** — Reddit allows ~1 call per 30-60s on low-reputation IPs, vs Webshare's pool of rotating residential IPs that get a fresh budget per request
+- **Engagement metrics (score, num_comments) are missing from the Atom body** — Popping's `reddit_client._parse_atom_entries` synthesizes them as `None`, which the engagement scoring treats as 0. Cards still show up, just with slightly lower composite scores. Cross-reference sweep ("is there a Reddit thread about this URL?") still works.
+- **Direct from the proxy's host IP** — the egress is whatever IP the proxy container has, not a residential pool. Operators on a TELUS residential v4 with a heavy Reddit reputation bucket may still get 429s; test first with `curl https://www.reddit.com/r/worldnews/hot.rss?limit=3` from inside the proxy container.
+
+**Setup:**
+1. Run the proxy on a host with a friendly IP (any LAN host that gets 200s on `curl https://www.reddit.com/r/worldnews/hot.rss?limit=3`)
+2. **Do not set `WEBSHARE_TOKEN`** in the proxy's environment
+3. Tell Popping to use the proxy in `.rss` mode by configuring its `reddit_client` to call the `.rss` URL on the proxy — this is the default for any backend built on `reddit_client._get_atom` (the live `popping-backend:latest` does this automatically when `REDDIT_HYDRA_URL` is set; the path it constructs is `f"/r/{subreddit}/{listing}.rss?limit=N"`, which the proxy now serves)
+
+**Tell-tale sign it's working:** the proxy's startup log will say `routing: direct (no WEBSHARE_TOKEN; expect 403s on .json from datacenter IPs -- use .rss suffix for direct residential egress)`. The `[upstream] /r/<sub>/<listing>.rss?limit=N -> 200 (ct=application/atom+xml; ...)` log line in the proxy confirms a 200 OK from Reddit on the `.rss` path.
 
 ### 2. Start the container
 
