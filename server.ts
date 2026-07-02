@@ -1,27 +1,35 @@
 /**
  * Popping Reddit proxy.
  *
- * Tiny front-end for Reddit's public JSON API. Popping's per-subreddit
- * plugin and cross-reference sweep call this instead of Reddit directly
- * so:
- *   - All Reddit traffic leaves one IP (yours, on the VPS), not the
- *     dashboard's. Reddit throttles hard on datacenter IPs that poll
- *     `/r/{sub}/hot.json` on a schedule; routing it through one
- *     residential-ish box keeps the 429s down.
+ * Tiny front-end for Reddit's public listing APIs. Popping's
+ * per-subreddit plugin and cross-reference sweep call this instead of
+ * Reddit directly so:
+ *   - All Reddit traffic leaves one IP (yours, on a friendly network),
+ *     not the dashboard's. Reddit throttles hard on datacenter IPs
+ *     that poll `/r/{sub}/hot.json` on a schedule; routing it through
+ *     one known-good box keeps the 429s down.
  *   - A single, controlled rate limiter is the only thing talking to
  *     Reddit in a given window. Easier to reason about than N
  *     independent Popping clients.
  *   - Popping's existing `reddit_client.py` works without changes —
- *     this proxy returns the same flat list shape the plugin already
- *     consumes.
+ *     this proxy returns the same flat list shape (JSON mode) or the
+ *     same raw Atom XML body (RSS mode) the plugin already consumes.
  *
  * Endpoints
  * ---------
  *   GET /r/:sub/:listing?limit=N      -> Reddit `data.children[]`
  *                                          unwrapped to a flat list
+ *                                          (JSON mode; current default)
  *   GET /r/:sub/:listing.json?limit=N -> same as above; the
  *                                          trailing ".json" is optional
  *                                          and ignored
+ *   GET /r/:sub/:listing.rss?limit=N  -> Reddit's Atom XML body
+ *                                          relayed unchanged (RSS mode).
+ *                                          Popping's
+ *                                          `reddit_client._get_atom`
+ *                                          parses this in-process; the
+ *                                          proxy just changes the
+ *                                          egress IP.
  *   GET /search?url=...                   -> Reddit's own
  *                                             /search.json?q=url:...
  *                                             first result as
@@ -31,13 +39,26 @@
  *
  * Reddit endpoints called
  * -----------------------
- *   https://www.reddit.com/r/{sub}/{listing}.json?limit=N
+ *   https://www.reddit.com/r/{sub}/{listing}.json?limit=N     (JSON mode)
+ *   https://www.reddit.com/r/{sub}/{listing}.rss?limit=N      (RSS mode)
  *   https://www.reddit.com/search.json?q=url%3A{url}&limit=1&sort=relevance
  *
- * Why not oauth.reddit.com: the unauthenticated `.json` endpoints are
- * sufficient for read-only listing data. OAuth would require shipping
- * a client_id/secret in the proxy config and adds nothing for this
- * use case.
+ * Why two modes
+ * -------------
+ * Reddit's `.json` CDN path does a JS challenge on every IP that
+ * isn't classified as residential — a 189 KB HTML block page that
+ * a CLI fetch can't pass. The `.rss` path is on the same Fastly edge
+ * but a different code path that doesn't do JS challenges; it serves
+ * real Atom XML to most IPs, with a much smaller per-IP rate budget
+ * (~1 call per 30-60s on low-reputation IPs). Operators on a
+ * residential-class egress (home ISP, friendly VPS) should use
+ * `.rss`; operators on a residential pool (Webshare) should use
+ * `.json`. The proxy supports both via the URL suffix.
+ *
+ * Why not oauth.reddit.com: the unauthenticated `.rss` / `.json`
+ * endpoints are sufficient for read-only listing data. OAuth would
+ * require shipping a client_id/secret in the proxy config and adds
+ * nothing for this use case.
  *
  * Rate limiting
  * -------------
@@ -131,7 +152,7 @@ const WEBSHARE_PROXY_URL = WEBSHARE_TOKEN
     })()
   : null;
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Token-bucket rate limiter.
@@ -290,20 +311,35 @@ const server = Bun.serve({
       return jsonResponse({ ok: true, version: VERSION });
     }
 
-    // Subreddit listing.
-    //   GET /r/:sub/:listing?limit=N
-    //   GET /r/:sub/:listing.json?limit=N
+    // Subreddit listing. Three URL shapes route to the same handler:
+    //
+    //   GET /r/:sub/:listing?limit=N       (JSON mode, no suffix)
+    //   GET /r/:sub/:listing.json?limit=N (JSON mode, explicit suffix)
+    //   GET /r/:sub/:listing.rss?limit=N  (RSS mode)
+    //
     // :sub is one path segment; :listing is the next. The regex
-    // accepts an optional trailing ".json" so both /r/python/hot
-    // and /r/python/hot.json route to the same handler — clients
-    // that hardcode the .json suffix (Reddit's own URL shape) get
-    // the same response without a 404. The regex still rejects
-    // anything else (e.g. /r/foo/bar/baz or
+    // accepts an optional trailing ".json" (so /r/python/hot and
+    // /r/python/hot.json both route to JSON mode) OR a trailing
+    // ".rss" (RSS mode). The two suffixes map to different upstream
+    // paths and different response shapes:
+    //
+    //   .json / no suffix -> GET /r/<sub>/<listing>.json?limit=N
+    //                        -> flat list of post dicts (Reddit's
+    //                        data.children unwrapped)
+    //   .rss              -> GET /r/<sub>/<listing>.rss?limit=N
+    //                        -> Reddit's Atom XML body, relayed
+    //                        unchanged. The caller parses the XML
+    //                        (Popping's reddit_client._get_atom does
+    //                        this in-process).
+    //
+    // The regex still rejects anything else (e.g. /r/foo/bar/baz or
     // /r/foo/comments/abc) — Reddit's /r/{sub}/comments/{id}
     // endpoint isn't a listing shape and Popping never calls it.
-    const subMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.json)?$/.exec(url.pathname);
+    const subMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(url.pathname);
     if (subMatch) {
-      const [, sub, listing] = subMatch;
+      const [, sub, listing, suffix] = subMatch;
+      const format: "json" | "rss" =
+        suffix === "rss" ? "rss" : "json";
       const limitRaw = url.searchParams.get("limit");
       const limit = Math.max(
         1,
@@ -311,10 +347,10 @@ const server = Bun.serve({
       );
       await takeToken();
       let upstream: Response;
-      const reqPath = `/r/${sub}/${listing}?limit=${limit}`;
+      const reqPath = `/r/${sub}/${listing}.${format}?limit=${limit}`;
       try {
         upstream = await fetchReddit(
-          `/r/${encodeURIComponent(sub)}/${encodeURIComponent(listing)}.json?limit=${limit}`,
+          `/r/${encodeURIComponent(sub)}/${encodeURIComponent(listing)}.${format}?limit=${limit}`,
         );
       } catch (e) {
         console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
@@ -336,6 +372,24 @@ const server = Bun.serve({
           text.slice(0, 500),
           headers,
         );
+      }
+      if (format === "rss") {
+        // RSS mode: pass the Atom XML through unchanged. The caller
+        // (Popping's reddit_client._get_atom) parses the XML. We
+        // forward the upstream Content-Type so the caller can sniff
+        // the format if it wants to, and add a Cache-Control that
+        // matches the JSON-mode response (no-store) so a stale proxy
+        // never feeds the parser an old body.
+        const body = await upstream.text();
+        return new Response(body, {
+          status: 200,
+          headers: {
+            "Content-Type":
+              upstream.headers.get("content-type") ??
+              "application/atom+xml; charset=utf-8",
+            "Cache-Control": "no-store",
+          },
+        });
       }
       let parsed: unknown;
       try {
@@ -406,7 +460,7 @@ const server = Bun.serve({
 
 const route = WEBSHARE_PROXY_URL
   ? `Webshare residential pool (token set)`
-  : `direct (no WEBSHARE_TOKEN; expect 403s on datacenter IPs)`;
+  : `direct (no WEBSHARE_TOKEN; expect 403s on .json from datacenter IPs -- use .rss suffix for direct residential egress)`;
 console.log(
   `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: ${route})`,
 );
