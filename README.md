@@ -40,9 +40,9 @@ The proxy is a plain Bun app — no host setup needed, no kernel networking, no 
 docker run -d --name popping-proxy \
   --restart unless-stopped \
   -p 127.0.0.1:3001:3001 \
-  -e USER_AGENT="popping-proxy/1.0 (+https://github.com/<owner>/popping-proxy; contact: you@yourdomain.com)" \
+  -e USER_AGENT="popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy; contact: phil@philjnewman.com)" \
   -e WEBSHARE_TOKEN="abc123xyz-mysecretpassword" \
-  ghcr.io/<owner>/popping-proxy:latest
+  ghcr.io/compactly8274/popping-proxy:latest
 ```
 
 The startup log should read:
