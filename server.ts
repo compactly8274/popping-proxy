@@ -1,34 +1,50 @@
-/** 
- * PATCHED: Popping Reddit proxy with support for comment thread endpoints.
+/**
+ * popping-proxy — Reddit .rss/.json relay, v1.3.0
  *
- * This version adds support for Reddit comment thread RSS endpoints in addition
- * to the original subreddit listing endpoints.
+ * Endpoints:
+ *   GET /healthz
+ *   GET /r/{sub}/{listing}[.rss|.json]?limit=N      (listings)
+ *   GET /r/{sub}/comments/{id}[/{slug}][.rss|.json] (comment threads)
+ *   GET /search?url=...                             (cross-reference search)
+ *
+ * Resilience:
+ *   - In-memory response cache (CACHE_TTL_S). Serve-stale-on-error.
+ *   - Token bucket — requests WAIT for a token, never rejected.
+ *   - Fallback chain: if upstream Reddit returns a transient error
+ *     (403 block or 429 rate-limit) for a COMMENT .rss request AND
+ *     FALLBACK_PROXY_URL is set, the request is forwarded ONCE to the
+ *     fallback hop. No retry loops. FALLBACK_COOLDOWN_MS prevents
+ *     hammering the fallback hop when it is itself throttling.
+ *   - Honest error classification: 403 block vs 429 rate-limit are
+ *     distinguished, logged, and surfaced via X-Error-Kind header plus
+ *     a Retry-After (real or estimated) so the backend/UI can tell the
+ *     user "blocked" from "try again shortly".
  */
 
 const PORT = Number(process.env.PORT ?? 3001);
 const DEFAULT_USER_AGENT =
-  "popping-proxy/1.0 (+https://example.com/popping-proxy)";
+  "popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy)";
 
 const USER_AGENT = process.env.USER_AGENT ?? DEFAULT_USER_AGENT;
-const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 2);
-const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
-const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
+const RATE_SUSTAINED = Number(process.env.RATE_SUSTAINED ?? 0.1);
+const RATE_BURST = Number(process.env.RATE_BURST ?? 3);
+const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 15);
+const CACHE_TTL_S = Number(process.env.CACHE_TTL_S ?? 300);
+const STALE_MAX_S = Number(process.env.STALE_MAX_S ?? 3600);
 
-// Webshare residential proxy pool
-const WEBSHARE_TOKEN=process.env.WEBSHARE_TOKEN ?? "";
-const WEBSHARE_PROXY_URL = WEBSHARE_TOKEN
-  ? (() => {
-      const dash = WEBSHARE_TOKEN.indexOf("-");
-      if (dash < 1 || dash === WEBSHARE_TOKEN.length - 1) return null;
-      const user = WEBSHARE_TOKEN.slice(0, dash);
-      const pass = WEBSHARE_TOKEN.slice(dash + 1);
-      return `http://${user}:${pass}@p.webshare.io:80`;
-    })()
-  : null;
+// Fallback hop (e.g. RackNerd proxy reachable over the wg tunnel).
+// Unset => no fallback, identical behavior to v1.2.0.
+const FALLBACK_PROXY_URL = (process.env.FALLBACK_PROXY_URL ?? "").trim();
+const FALLBACK_TIMEOUT_S = Number(process.env.FALLBACK_TIMEOUT_S ?? 20);
+// Cooldown after the fallback hop returns a throttling error (429/5xx).
+// Prevents this proxy from hammering the fallback into its own block.
+const FALLBACK_COOLDOWN_MS = Number(process.env.FALLBACK_COOLDOWN_MS ?? 15000);
 
-const VERSION = "1.1.0";
+const VERSION = "1.3.0";
 
-// Token-bucket rate limiter.
+// ---------------------------------------------------------------------------
+// Token bucket — requests wait for a token; the bucket never rejects.
+// ---------------------------------------------------------------------------
 const bucket = { tokens: RATE_BURST, last: Date.now() };
 
 function takeToken(): Promise<void> {
@@ -36,10 +52,7 @@ function takeToken(): Promise<void> {
     const tryConsume = () => {
       const now = Date.now();
       const elapsed = (now - bucket.last) / 1000;
-      bucket.tokens = Math.min(
-        RATE_BURST,
-        bucket.tokens + elapsed * RATE_SUSTAINED,
-      );
+      bucket.tokens = Math.min(RATE_BURST, bucket.tokens + elapsed * RATE_SUSTAINED);
       bucket.last = now;
       if (bucket.tokens >= 1) {
         bucket.tokens -= 1;
@@ -53,24 +66,145 @@ function takeToken(): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Response cache — LRU-ish, success-only, stale-serve on upstream errors.
+// ---------------------------------------------------------------------------
+type CacheEntry = { status: number; ct: string | null; body: string; at: number };
+const cache = new Map<string, CacheEntry>();
+const CACHE_MAX_ENTRIES = 300;
+
+function cacheGet(key: string): CacheEntry | null {
+  const e = cache.get(key);
+  if (!e) return null;
+  cache.delete(key);
+  cache.set(key, e); // LRU touch
+  return e;
+}
+
+function cachePut(key: string, entry: CacheEntry): void {
+  cache.set(key, entry);
+  while (cache.size > CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error classification — distinguish Reddit's hard block from rate-limit.
+// ---------------------------------------------------------------------------
+function classifyError(status: number, bodyFragment?: string): "block" | "rate_limit" | "other" {
+  if (status === 429) return "rate_limit";
+  if (status === 403) {
+    const b = (bodyFragment ?? "").toLowerCase();
+    if (b.includes("blocked by network security") || b.includes("network security")) {
+      return "block";
+    }
+    return "other";
+  }
+  if (status >= 500) return "rate_limit"; // transient server error, retryable
+  return "other";
+}
+
+// Parse Retry-After (seconds or HTTP-date). Returns seconds, or null.
+function parseRetryAfter(v: string | null): number | null {
+  if (!v) return null;
+  const n = Number(v);
+  if (Number.isFinite(n) && n >= 0) return n;
+  // HTTP-date form.
+  const t = Date.parse(v);
+  if (!Number.isNaN(t)) return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  return null;
+}
+
+// Estimate a wait when Reddit didn't send Retry-After. Scales with cooldown.
+function estimateRetryAfter(kind: "block" | "rate_limit" | "other"): number {
+  if (kind === "block") return 60; // hard block: retry no sooner than a minute
+  if (kind === "rate_limit") return 30;
+  return 15;
+}
+
+// ---------------------------------------------------------------------------
+// Upstream fetch (primary: this host's egress)
+// ---------------------------------------------------------------------------
 async function fetchReddit(path: string): Promise<Response> {
   const url = `https://www.reddit.com${path}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_S * 1000);
-  const init: RequestInit & { proxy?: string } = {
-    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-    signal: ctrl.signal,
-  };
-  if (WEBSHARE_PROXY_URL) {
-    init.proxy = WEBSHARE_PROXY_URL;
-  }
   try {
-    return await fetch(url, init);
+    return await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, application/json;q=0.8, */*;q=0.7",
+      },
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
   } finally {
     clearTimeout(timer);
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fallback fetch — forward the SAME path to a fallback hop ONCE.
+// ---------------------------------------------------------------------------
+let fallbackCooldownUntil = 0;
+
+async function fetchViaFallback(pathWithQuery: string, logTag: string): Promise<Response | null> {
+  if (!FALLBACK_PROXY_URL) return null;
+  if (Date.now() < fallbackCooldownUntil) {
+    console.log(`[fallback] skipped (cooldown) ${logTag}`);
+    return errorResponse(503, "fallback_cooldown");
+  }
+  const url = `${FALLBACK_PROXY_URL}${pathWithQuery}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FALLBACK_TIMEOUT_S * 1000);
+  console.log(`[fallback] try ${url}`);
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, application/json;q=0.8, */*;q=0.7",
+      },
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
+    const status = resp.status;
+    const ct = resp.headers.get("content-type") ?? "?";
+    const len = resp.headers.get("content-length") ?? "?";
+    console.log(`[fallback] ${logTag} -> ${status} (ct=${ct}, len=${len})`);
+    if (status === 429 || status >= 500) {
+      // Fallback hop is itself throttling — back off so we don't flag its ASN.
+      fallbackCooldownUntil = Date.now() + FALLBACK_COOLDOWN_MS;
+      const kind = status === 429 ? "rate_limit" : "other";
+      const ra = parseRetryAfter(resp.headers.get("Retry-After")) ?? estimateRetryAfter(kind);
+      const body = await resp.text().catch(() => "");
+      return errorResponse(status, "upstream_error", body.slice(0, 500), {
+        "X-Error-Kind": kind,
+        "Retry-After": String(ra),
+      });
+    }
+    // Pass the fallback body through verbatim (it serves the same path shape).
+    const body = await resp.text();
+    return new Response(body, {
+      status,
+      headers: {
+        "Content-Type": ct ?? "application/atom+xml; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Fallback": "true",
+      },
+    });
+  } catch (e) {
+    console.log(`[fallback] ${logTag} -> network_error: ${e}`);
+    return null; // fallback failed too; caller returns original error
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Response helpers
+// ---------------------------------------------------------------------------
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
     ...init,
@@ -90,175 +224,116 @@ function errorResponse(
 ): Response {
   const body: Record<string, unknown> = { error };
   if (detail !== undefined) body.detail = detail;
-  return jsonResponse(body, {
-    status,
-    headers: extraHeaders,
+  return jsonResponse(body, { status, headers: extraHeaders });
+}
+
+function serveBody(
+  body: string,
+  upstreamCt: string | null,
+  viaCache: boolean,
+): Response {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": upstreamCt ?? "application/atom+xml; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Cache": viaCache ? "hit" : "miss",
+    },
   });
 }
 
-const server = Bun.serve({
-  port: PORT,
-  hostname: "0.0.0.0",
-  async fetch(req) {
-    const url = new URL(req.url);
+// ---------------------------------------------------------------------------
+// Shared upstream path: token -> fetch -> cache/stale-serve.
+// For comment .rss requests, a single fallback attempt runs on transient errors.
+// ---------------------------------------------------------------------------
+async function fetchWithResilience(
+  cacheKey: string,
+  upstreamPath: string,
+  logTag: string,
+  opts: { allowFallback?: boolean } = {},
+): Promise<Response> {
+  const cached = cacheGet(cacheKey);
+  const now = Date.now();
 
-    console.log(`[req] ${req.method} ${url.pathname}${url.search}`);
+  // Fresh cache hit: serve immediately, no upstream call, no token.
+  if (cached && (now - cached.at) / 1000 < CACHE_TTL_S) {
+    console.log(`[cache] fresh ${logTag}`);
+    return serveBody(cached.body, cached.ct, true);
+  }
 
-    if (url.pathname === "/healthz") {
-      return jsonResponse({ ok: true, version: VERSION });
+  await takeToken();
+  let upstream: Response;
+  try {
+    upstream = await fetchReddit(upstreamPath);
+  } catch (e) {
+    console.log(`[upstream] ${logTag} -> network_error: ${e}`);
+    if (cached && (now - cached.at) / 1000 < STALE_MAX_S) {
+      console.log(`[cache] stale-serve after network_error ${logTag}`);
+      return serveBody(cached.body, cached.ct, true);
     }
+    return errorResponse(502, "upstream_unreachable", String(e));
+  }
 
-    // Handle subreddit listing endpoints
-    const listingMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(url.pathname);
-    
-    // Handle comment thread endpoints (NEW functionality)
-    const commentMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]*)?\/?(?:\.(json|rss))?$/.exec(url.pathname);
-    
-    if (listingMatch) {
-      const [, sub, listing, suffix] = listingMatch;
-      const format: "json" | "rss" = suffix === "rss" ? "rss" : "json";
-      const limitRaw = url.searchParams.get("limit");
-      const limit = Math.max(1, Math.min(100, Number(limitRaw ?? 25) || 25));
-      await takeToken();
-      let upstream: Response;
-      const reqPath = `/r/${sub}/${listing}.${format}?limit=${limit}`;
-      try {
-        upstream = await fetchReddit(
-          `/r/${encodeURIComponent(sub)}/${encodeURIComponent(listing)}.${format}?limit=${limit}`,
-        );
-      } catch (e) {
-        console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
-        return errorResponse(502, "upstream_unreachable", String(e));
-      }
-      const upCT = upstream.headers.get("content-type") ?? "?";
-      const upLen = upstream.headers.get("content-length") ?? "?";
-      console.log(`[upstream] ${reqPath} -> ${upstream.status} (ct=${upCT}, len=${upLen})`);
-      if (!upstream.ok) {
-        const text = await upstream.text().catch(() => "");
-        const headers: Record<string, string> = {};
-        const ra = upstream.headers.get("Retry-After");
-        if (ra) headers["Retry-After"] = ra;
-        return errorResponse(upstream.status, "upstream_error", text.slice(0, 500), headers);
-      }
-      if (format === "rss") {
-        const body = await upstream.text();
-        return new Response(body, {
-          status: 200,
-          headers: {
-            "Content-Type": upstream.headers.get("content-type") ?? "application/atom+xml; charset=utf-8",
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      let parsed: unknown;
-      try {
-        parsed = await upstream.json();
-      } catch {
-        return errorResponse(502, "upstream_invalid_json");
-      }
-      if (!isListing(parsed)) {
-        return errorResponse(502, "upstream_unexpected_shape");
-      }
-      return jsonResponse(flattenListing(parsed));
+  const upCT = upstream.headers.get("content-type");
+  const upLen = upstream.headers.get("content-length") ?? "?";
+  console.log(`[upstream] ${logTag} -> ${upstream.status} (ct=${upCT ?? "?"}, len=${upLen})`);
+
+  if (upstream.ok) {
+    const body = await upstream.text();
+    cachePut(cacheKey, { status: 200, ct: upCT, body, at: Date.now() });
+    return serveBody(body, upCT, false);
+  }
+
+  // Transient upstream failure: 429 / 5xx — serve stale if we have it.
+  if (
+    (upstream.status === 429 || upstream.status >= 500) &&
+    cached &&
+    (now - cached.at) / 1000 < STALE_MAX_S
+  ) {
+    console.log(`[cache] stale-serve after ${upstream.status} ${logTag}`);
+    return serveBody(cached.body, cached.ct, true);
+  }
+
+  // Read the error body to classify it.
+  const text = await upstream.text().catch(() => "");
+  const kind = classifyError(upstream.status, text);
+  const retryAfter = parseRetryAfter(upstream.headers.get("Retry-After")) ?? estimateRetryAfter(kind);
+  const headers: Record<string, string> = {
+    "X-Error-Kind": kind,
+    "Retry-After": String(retryAfter),
+  };
+  if (kind === "block") {
+    console.log(`[block] ${logTag} -> Reddit network-security block (403)`);
+  } else if (kind === "rate_limit") {
+    console.log(`[rate-limit] ${logTag} -> retry-after ~${retryAfter}s`);
+  }
+
+  // OPTIONAL: single fallback attempt for comment .rss requests.
+  // Only triggers on transient errors (block/rate-limit), never loops.
+  if (opts.allowFallback && FALLBACK_PROXY_URL && (kind === "block" || kind === "rate_limit")) {
+    const u = new URL(`https://www.reddit.com${upstreamPath}`);
+    const pathWithQuery = u.pathname + u.search;
+    const fallbackResp = await fetchViaFallback(pathWithQuery, logTag);
+    if (fallbackResp && fallbackResp.status !== 503) {
+      return fallbackResp;
     }
-    
-    // Handle comment thread endpoints (NEW functionality)
-    if (commentMatch) {
-      const [, sub, id, suffix] = commentMatch;
-      const format: "json" | "rss" = suffix === "rss" ? "rss" : "json";
-      await takeToken();
-      let upstream: Response;
-      const reqPath = `/r/${sub}/comments/${id}.${format}`;
-      try {
-        // Fetch the comment thread from Reddit
-        upstream = await fetchReddit(
-          `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}.${format}`,
-        );
-      } catch (e) {
-        console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
-        return errorResponse(502, "upstream_unreachable", String(e));
-      }
-      const upCT = upstream.headers.get("content-type") ?? "?";
-      const upLen = upstream.headers.get("content-length") ?? "?";
-      console.log(`[upstream] ${reqPath} -> ${upstream.status} (ct=${upCT}, len=${upLen})`);
-      if (!upstream.ok) {
-        const text = await upstream.text().catch(() => "");
-        const headers: Record<string, string> = {};
-        const ra = upstream.headers.get("Retry-After");
-        if (ra) headers["Retry-After"] = ra;
-        return errorResponse(upstream.status, "upstream_error", text.slice(0, 500), headers);
-      }
-      if (format === "rss") {
-        const body = await upstream.text();
-        return new Response(body, {
-          status: 200,
-          headers: {
-            "Content-Type": upstream.headers.get("content-type") ?? "application/atom+xml; charset=utf-8",
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      let parsed: unknown;
-      try {
-        parsed = await upstream.json();
-      } catch {
-        return errorResponse(502, "upstream_invalid_json");
-      }
-      
-      // For comment threads, the response structure is different
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        return jsonResponse(parsed);
-      } else if (parsed && typeof parsed === "object") {
-        return jsonResponse(parsed);
-      } else {
-        return errorResponse(502, "upstream_unexpected_shape");
-      }
-    }
+  }
 
-    // Cross-reference search.
-    if (url.pathname === "/search") {
-      const target = url.searchParams.get("url");
-      if (!target) {
-        return errorResponse(400, "missing_url");
-      }
-      await takeToken();
-      const q = `url:${target}`;
-      let upstream: Response;
-      const reqPath = `/search?url=${target.slice(0, 80)}`;
-      try {
-        upstream = await fetchReddit(
-          `/search.json?q=${encodeURIComponent(q)}&limit=1&sort=relevance&restrict_sr=&type=link`,
-        );
-      } catch (e) {
-        console.log(`[upstream] ${reqPath} -> network_error: ${e}`);
-        return errorResponse(502, "upstream_unreachable", String(e));
-      }
-      const upCT = upstream.headers.get("content-type") ?? "?";
-      const upLen = upstream.headers.get("content-length") ?? "?";
-      console.log(`[upstream] ${reqPath} -> ${upstream.status} (ct=${upCT}, len=${upLen})`);
-      if (!upstream.ok) {
-        const text = await upstream.text().catch(() => "");
-        return errorResponse(upstream.status, "upstream_error", text.slice(0, 500));
-      }
-      let parsed: unknown;
-      try {
-        parsed = await upstream.json();
-      } catch {
-        return errorResponse(502, "upstream_invalid_json");
-      }
-      if (!isListing(parsed)) {
-        return errorResponse(502, "upstream_unexpected_shape");
-      }
-      const flat = flattenListing(parsed);
-      const hit = flat.length > 0 ? searchHitShape(flat[0]) : null;
-      return jsonResponse(hit ? [hit] : []);
-    }
+  return errorResponse(upstream.status, "upstream_error", text.slice(0, 500), headers);
+}
 
-    return errorResponse(404, "not_found", { path: url.pathname });
-  },
-});
+// ---------------------------------------------------------------------------
+// Listing shapes (JSON mode)
+// ---------------------------------------------------------------------------
+interface RedditChild {
+  kind: string;
+  data: Record<string, unknown>;
+}
+interface RedditListing {
+  kind: "Listing";
+  data: { children: RedditChild[] };
+}
 
-// Helper functions
 function isListing(x: unknown): x is RedditListing {
   return (
     typeof x === "object" &&
@@ -266,16 +341,6 @@ function isListing(x: unknown): x is RedditListing {
     (x as { kind?: unknown }).kind === "Listing" &&
     Array.isArray((x as { data?: { children?: unknown } }).data?.children)
   );
-}
-
-interface RedditChild {
-  kind: string;
-  data: Record<string, unknown>;
-}
-
-interface RedditListing {
-  kind: "Listing";
-  data: { children: RedditChild[] };
 }
 
 function flattenListing(listing: RedditListing): Record<string, unknown>[] {
@@ -295,8 +360,103 @@ function searchHitShape(post: Record<string, unknown>): {
   return { permalink, num_comments };
 }
 
-const route = WEBSHARE_PROXY_URL
-  ? `Webshare residential pool (token set)`
-  : `direct (no WEBSHARE_TOKEN; expect 403s on .json from datacenter IPs -- use .rss suffix for direct residential egress)`;
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+const server = Bun.serve({
+  port: PORT,
+  hostname: "0.0.0.0",
+  async fetch(req) {
+    const url = new URL(req.url);
+    console.log(`[req] ${req.method} ${url.pathname}${url.search}`);
 
-console.log(`popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: ${route})`);
+    if (url.pathname === "/healthz") {
+      return jsonResponse({ ok: true, version: VERSION });
+    }
+
+    // Normalize trailing slash before extension.
+    const normalized = url.pathname.replace(/\/\.(rss|json)$/i, ".$1");
+
+    const listingMatch =
+      /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(normalized);
+    const commentMatch =
+      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]+)?(?:\.(json|rss))?$/.exec(
+        normalized,
+      );
+
+    // Listings (non-comment)
+    if (listingMatch && !commentMatch) {
+      const [, sub, listing, suffix] = listingMatch;
+      const isRss = suffix === "rss";
+      const limitRaw = url.searchParams.get("limit");
+      const limit = Math.max(1, Math.min(100, Number(limitRaw ?? 25) || 25));
+      const upstreamPath = `/r/${encodeURIComponent(sub)}/${encodeURIComponent(listing)}.${isRss ? "rss" : "json"}?limit=${limit}`;
+      const cacheKey = `L ${upstreamPath}`;
+      const resp = await fetchWithResilience(cacheKey, upstreamPath, `/r/${sub}/${listing}.${isRss ? "rss" : "json"}?limit=${limit}`);
+      if (resp.status !== 200) return resp;
+      if (isRss) return resp;
+      const ct = resp.headers.get("Content-Type") ?? "";
+      if (!ct.includes("json")) return resp;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await resp.text());
+      } catch {
+        return errorResponse(502, "upstream_invalid_json");
+      }
+      if (!isListing(parsed)) {
+        return errorResponse(502, "upstream_unexpected_shape");
+      }
+      return jsonResponse(flattenListing(parsed));
+    }
+
+    // Comment threads
+    if (commentMatch) {
+      const [, sub, id, suffix] = commentMatch;
+      const isRss = suffix === "rss";
+      const upstreamPath = `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}.${isRss ? "rss" : "json"}`;
+      const cacheKey = `T ${upstreamPath}`;
+      // Fallback chain engaged for comment .rss only (the path where a
+      // different egress IP can realistically help).
+      return await fetchWithResilience(
+        cacheKey,
+        upstreamPath,
+        `/r/${sub}/comments/${id}.${isRss ? "rss" : "json"}`,
+        { allowFallback: isRss },
+      );
+    }
+
+    // Cross-reference search.
+    if (url.pathname === "/search") {
+      const target = url.searchParams.get("url");
+      if (!target) {
+        return errorResponse(400, "missing_url");
+      }
+      const q = `url:${target}`;
+      const upstreamPath = `/search.json?q=${encodeURIComponent(q)}&limit=1&sort=relevance&restrict_sr=&type=link`;
+      const cacheKey = `S ${upstreamPath}`;
+      const resp = await fetchWithResilience(cacheKey, upstreamPath, `/search?url=${target.slice(0, 80)}`);
+      if (resp.status !== 200) return resp;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await resp.text());
+      } catch {
+        return errorResponse(502, "upstream_invalid_json");
+      }
+      if (!isListing(parsed)) {
+        return errorResponse(502, "upstream_unexpected_shape");
+      }
+      const flat = flattenListing(parsed);
+      const hit = flat.length > 0 ? searchHitShape(flat[0]) : null;
+      return jsonResponse(hit ? [hit] : []);
+    }
+
+    return errorResponse(404, "not_found", { path: url.pathname });
+  },
+});
+
+const route = FALLBACK_PROXY_URL
+  ? `direct + cache + stale-on-error + fallback(${FALLBACK_PROXY_URL})`
+  : "direct (residential egress) + cache + stale-on-error";
+console.log(
+  `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: ${route}; ttl=${CACHE_TTL_S}s, stale-max=${STALE_MAX_S}s, rate=${RATE_SUSTAINED}/s burst=${RATE_BURST})`,
+);
