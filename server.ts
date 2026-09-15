@@ -15,7 +15,7 @@ const RATE_BURST = Number(process.env.RATE_BURST ?? 4);
 const UPSTREAM_TIMEOUT_S = Number(process.env.UPSTREAM_TIMEOUT_S ?? 10);
 
 // Webshare residential proxy pool
-const WEBSHARE_TOKEN = process.env.WEBSHARE_TOKEN ?? "";
+const WEBSHARE_TOKEN=process.env.WEBSHARE_TOKEN ?? "";
 const WEBSHARE_PROXY_URL = WEBSHARE_TOKEN
   ? (() => {
       const dash = WEBSHARE_TOKEN.indexOf("-");
@@ -112,7 +112,7 @@ const server = Bun.serve({
     const listingMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(url.pathname);
     
     // Handle comment thread endpoints (NEW functionality)
-    const commentMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]*)?(?:\.(json|rss))?$/.exec(url.pathname);
+    const commentMatch = /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]*)?\/?(?:\.(json|rss))?$/.exec(url.pathname);
     
     if (listingMatch) {
       const [, sub, listing, suffix] = listingMatch;
@@ -170,6 +170,7 @@ const server = Bun.serve({
       let upstream: Response;
       const reqPath = `/r/${sub}/comments/${id}.${format}`;
       try {
+        // Fetch the comment thread from Reddit
         upstream = await fetchReddit(
           `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}.${format}`,
         );
