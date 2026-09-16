@@ -381,7 +381,7 @@ const server = Bun.serve({
     const listingMatch =
       /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(normalized);
     const commentMatch =
-      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]+)*\/?(?:\.(json|rss))?$/.exec(
+      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/\.]+)*(?:\.(json|rss))?$/.exec(
         normalized,
       );
 
