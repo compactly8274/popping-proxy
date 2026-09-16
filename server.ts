@@ -369,19 +369,32 @@ function parseCommentPath(
   const parts = pathname.split("/").filter(Boolean);
   if (parts.length < 4 || parts[0] !== "r" || parts[2] !== "comments") return null;
   const sub = parts[1];
-  const id = parts[3];
-  if (!/^[A-Za-z0-9_]{3,21}$/.test(sub) || !/^[A-Za-z0-9_]+$/.test(id)) return null;
+  if (!/^[A-Za-z0-9_]{3,21}$/.test(sub)) return null;
 
+  // Extract suffix from the last segment (e.g., id.rss, slug.rss, .rss).
   let suffix: "json" | "rss" | null = null;
-  // If the last segment is .rss/.json (or rss/json), treat it as suffix.
   const last = parts[parts.length - 1];
-  if (last === ".rss" || last === "rss") {
+  if (last.endsWith(".rss") || last === "rss") {
     suffix = "rss";
-    parts.pop();
-  } else if (last === ".json" || last === "json") {
+    const withoutSuffix = last === "rss" ? "" : last.slice(0, -4);
+    if (withoutSuffix) {
+      parts[parts.length - 1] = withoutSuffix;
+    } else {
+      parts.pop();
+    }
+  } else if (last.endsWith(".json") || last === "json") {
     suffix = "json";
-    parts.pop();
+    const withoutSuffix = last === "json" ? "" : last.slice(0, -5);
+    if (withoutSuffix) {
+      parts[parts.length - 1] = withoutSuffix;
+    } else {
+      parts.pop();
+    }
   }
+
+  const id = parts[3];
+  if (!/^[A-Za-z0-9_]+$/.test(id)) return null;
+
   // Any parts after id (slugs) are ignored.
   return { sub, id, suffix };
 }
