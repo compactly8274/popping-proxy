@@ -22,6 +22,7 @@
  */
 
 const PORT = Number(process.env.PORT ?? 3001);
+const HOST = process.env.HOST ?? "0.0.0.0";
 const DEFAULT_USER_AGENT =
   "popping-proxy/1.0 (+https://github.com/compactly8274/popping-proxy)";
 
@@ -365,7 +366,7 @@ function searchHitShape(post: Record<string, unknown>): {
 // ---------------------------------------------------------------------------
 const server = Bun.serve({
   port: PORT,
-  hostname: "0.0.0.0",
+  hostname: HOST,
   async fetch(req) {
     const url = new URL(req.url);
     console.log(`[req] ${req.method} ${url.pathname}${url.search}`);
@@ -458,5 +459,5 @@ const route = FALLBACK_PROXY_URL
   ? `direct + cache + stale-on-error + fallback(${FALLBACK_PROXY_URL})`
   : "direct (residential egress) + cache + stale-on-error";
 console.log(
-  `popping-proxy ${VERSION} listening on ${server.hostname}:${server.port} (routing: ${route}; ttl=${CACHE_TTL_S}s, stale-max=${STALE_MAX_S}s, rate=${RATE_SUSTAINED}/s burst=${RATE_BURST})`,
+  `popping-proxy ${VERSION} listening on ${HOST}:${server.port} (routing: ${route}; ttl=${CACHE_TTL_S}s, stale-max=${STALE_MAX_S}s, rate=${RATE_SUSTAINED}/s burst=${RATE_BURST})`,
 );
