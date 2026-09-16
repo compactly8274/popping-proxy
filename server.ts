@@ -373,10 +373,13 @@ function parseCommentPath(
   if (!/^[A-Za-z0-9_]{3,21}$/.test(sub) || !/^[A-Za-z0-9_]+$/.test(id)) return null;
 
   let suffix: "json" | "rss" | null = null;
-  // If the last segment is .rss/.json (possibly with a trailing slash), treat it as suffix.
+  // If the last segment is .rss/.json (or rss/json), treat it as suffix.
   const last = parts[parts.length - 1];
-  if (last === "rss" || last === "json") {
-    suffix = last;
+  if (last === ".rss" || last === "rss") {
+    suffix = "rss";
+    parts.pop();
+  } else if (last === ".json" || last === "json") {
+    suffix = "json";
     parts.pop();
   }
   // Any parts after id (slugs) are ignored.
