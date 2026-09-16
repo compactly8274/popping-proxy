@@ -361,6 +361,27 @@ function searchHitShape(post: Record<string, unknown>): {
   return { permalink, num_comments };
 }
 
+function parseCommentPath(
+  pathname: string,
+): { sub: string; id: string; suffix: "json" | "rss" | null } | null {
+  // Accept /r/{sub}/comments/{id}[/{slug}...][.rss|.json]
+  // and also /r/{sub}/comments/{id}[/{slug}...]/[.rss|.json]
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length < 4 || parts[0] !== "r" || parts[2] !== "comments") return null;
+  const sub = parts[1];
+  const id = parts[3];
+  if (!/^[A-Za-z0-9_]{3,21}$/.test(sub) || !/^[A-Za-z0-9_]+$/.test(id)) return null;
+
+  let suffix: "json" | "rss" | null = null;
+  // If the last segment is .rss/.json (possibly with a trailing slash), treat it as suffix.
+  const last = parts[parts.length - 1];
+  if (last === "rss" || last === "json") {
+    suffix = last;
+    parts.pop();
+  }
+  // Any parts after id (slugs) are ignored.
+  return { sub, id, suffix };
+}
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -380,10 +401,7 @@ const server = Bun.serve({
 
     const listingMatch =
       /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(normalized);
-    const commentMatch =
-      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/\.]+)*(?:\/|\.)?(json|rss)?$/.exec(
-        normalized,
-      );
+    const commentPath = parseCommentPath(normalized);
 
     // Listings (non-comment)
     if (listingMatch && !commentMatch) {
@@ -411,8 +429,8 @@ const server = Bun.serve({
     }
 
     // Comment threads
-    if (commentMatch) {
-      const [, sub, id, suffix] = commentMatch;
+    if (commentPath) {
+      const { sub, id, suffix } = commentPath;
       const isRss = suffix === "rss";
       const upstreamPath = `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}.${isRss ? "rss" : "json"}`;
       const cacheKey = `T ${upstreamPath}`;
