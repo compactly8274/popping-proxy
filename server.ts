@@ -368,34 +368,32 @@ function parseCommentPath(
   // and also /r/{sub}/comments/{id}[/{slug}...]/[.rss|.json]
   const parts = pathname.split("/").filter(Boolean);
   if (parts.length < 4 || parts[0] !== "r" || parts[2] !== "comments") return null;
-  const sub = parts[1];
-  if (!/^[A-Za-z0-9_]{3,21}$/.test(sub)) return null;
 
-  // Extract suffix from the last segment (e.g., id.rss, slug.rss, .rss).
+  // The last part may be an explicit suffix segment ("rss"/"json") when the URL
+  // ends with /.rss or /.json. Pop it so the real id segment is exposed.
   let suffix: "json" | "rss" | null = null;
   const last = parts[parts.length - 1];
-  if (last.endsWith(".rss") || last === "rss") {
-    suffix = "rss";
-    const withoutSuffix = last === "rss" ? "" : last.slice(0, -4);
-    if (withoutSuffix) {
-      parts[parts.length - 1] = withoutSuffix;
-    } else {
-      parts.pop();
-    }
-  } else if (last.endsWith(".json") || last === "json") {
-    suffix = "json";
-    const withoutSuffix = last === "json" ? "" : last.slice(0, -5);
-    if (withoutSuffix) {
-      parts[parts.length - 1] = withoutSuffix;
-    } else {
-      parts.pop();
-    }
+  if (last === "rss" || last === "json") {
+    suffix = last;
+    parts.pop();
   }
 
-  const id = parts[3];
-  if (!/^[A-Za-z0-9_]+$/.test(id)) return null;
+  // Now the last remaining part should be the post id; it may also carry the
+  // suffix directly (id.rss or id.json). Strip it.
+  const last2 = parts[parts.length - 1];
+  if (last2.endsWith(".rss")) {
+    suffix = "rss";
+    parts[parts.length - 1] = last2.slice(0, -4);
+  } else if (last2.endsWith(".json")) {
+    suffix = "json";
+    parts[parts.length - 1] = last2.slice(0, -5);
+  }
 
-  // Any parts after id (slugs) are ignored.
+  if (parts.length < 4) return null;
+  const sub = parts[1];
+  const id = parts[3];
+  if (!/^[A-Za-z0-9_]{3,21}$/.test(sub) || !/^[A-Za-z0-9_]+$/.test(id)) return null;
+
   return { sub, id, suffix };
 }
 // ---------------------------------------------------------------------------
