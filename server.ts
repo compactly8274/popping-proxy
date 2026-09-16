@@ -446,14 +446,15 @@ const server = Bun.serve({
     if (commentPath) {
       const { sub, id, suffix } = commentPath;
       const isRss = suffix === "rss";
-      const upstreamPath = `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}.${isRss ? "rss" : "json"}`;
+      // Reddit's comment RSS canonical path keeps the trailing slash before .rss.
+      const upstreamPath = `/r/${encodeURIComponent(sub)}/comments/${encodeURIComponent(id)}${isRss ? "/.rss" : ".json"}`;
       const cacheKey = `T ${upstreamPath}`;
       // Fallback chain engaged for comment .rss only (the path where a
       // different egress IP can realistically help).
       return await fetchWithResilience(
         cacheKey,
         upstreamPath,
-        `/r/${sub}/comments/${id}.${isRss ? "rss" : "json"}`,
+        `/r/${sub}/comments/${id}${isRss ? "/.rss" : ".json"}`,
         { allowFallback: isRss },
       );
     }
