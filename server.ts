@@ -375,13 +375,13 @@ const server = Bun.serve({
       return jsonResponse({ ok: true, version: VERSION });
     }
 
-    // Normalize trailing slash before extension.
-    const normalized = url.pathname.replace(/\/\.(rss|json)$/i, ".$1");
+    // Accept both /slug.rss and /slug/.rss by keeping the slash before extension.
+    const normalized = url.pathname;
 
     const listingMatch =
       /^\/r\/([A-Za-z0-9_]{3,21})\/([a-z]+)(?:\.(json|rss))?$/.exec(normalized);
     const commentMatch =
-      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]+)?(?:\.(json|rss))?$/.exec(
+      /^\/r\/([A-Za-z0-9_]{3,21})\/comments\/([A-Za-z0-9_]+)(?:\/[^\/]+)*\/?(?:\.(json|rss))?$/.exec(
         normalized,
       );
 
