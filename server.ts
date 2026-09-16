@@ -407,7 +407,7 @@ const server = Bun.serve({
     const commentPath = parseCommentPath(normalized);
 
     // Listings (non-comment)
-    if (listingMatch && !commentMatch) {
+    if (listingMatch && !commentPath) {
       const [, sub, listing, suffix] = listingMatch;
       const isRss = suffix === "rss";
       const limitRaw = url.searchParams.get("limit");
